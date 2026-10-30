@@ -1,0 +1,28 @@
+# ==============================================================================
+# Sample Crontab Configurations for Automated PDF-to-Audiobook Pipeline
+# ==============================================================================
+#
+# To install or edit your user crontab:
+#   crontab -e
+#
+# To check active crontab:
+#   crontab -l
+#
+# NOTE: The auto_pipeline.sh script uses a PID lockfile (logs/auto_pipeline.lock).
+# If a scheduled job triggers while a prior book is still converting (which can
+# take 30-90 minutes), the new invocation immediately exits with code 0 to
+# avoid GPU collisions or memory contention.
+#
+# ==============================================================================
+
+# Option A: Check every 30 minutes (Recommended for regular ingestion)
+*/30 * * * * /path/to/BookConverters/auto_pipeline.sh >> /path/to/BookConverters/logs/cron.log 2>&1
+
+# Option B: Check hourly at the top of the hour
+0 * * * * /path/to/BookConverters/auto_pipeline.sh >> /path/to/BookConverters/logs/cron.log 2>&1
+
+# Option C: Run once daily at 2:00 AM (Nightly batch)
+0 2 * * * /path/to/BookConverters/auto_pipeline.sh >> /path/to/BookConverters/logs/cron.log 2>&1
+
+# Option D: Check every 15 minutes with turbo TTS model
+*/15 * * * * /path/to/BookConverters/auto_pipeline.sh --model turbo >> /path/to/BookConverters/logs/cron.log 2>&1

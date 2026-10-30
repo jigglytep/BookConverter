@@ -1,0 +1,41 @@
+# CPU-only MinerU image.
+#
+# The official MinerU Dockerfile is built on vllm/vllm-openai (CUDA 13) and is
+# ~20 GB. If you are running the pipeline backend on CPU, none of that is used.
+# This image is ~2.5 GB because it pulls the CPU torch wheels instead.
+
+FROM python:3.12-slim-bookworm
+
+ARG MINERU_VERSION=3.4.5
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# libgl1 + libglib2.0-0 are opencv's runtime deps; libgomp1 is OpenMP for ONNX.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        libgl1 \
+        libglib2.0-0 \
+        libgomp1 \
+        fonts-dejavu-core \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --upgrade pip uv
+
+# Install CPU torch FIRST. If mineru[core] resolves torch on its own it will
+# drag in the CUDA build and several GB of nvidia-* wheels you will never load.
+RUN uv pip install --system --index-url https://download.pytorch.org/whl/cpu \
+        torch torchvision
+
+# mineru[core] = everything except vllm / lmdeploy / s3.
+# Pin with:  --build-arg MINERU_VERSION=3.4.5
+RUN uv pip install --system "mineru[core]==${MINERU_VERSION:-3.4.5}"
+
+RUN mkdir -p /models /data/in /data/out
+
+WORKDIR /data
+ENTRYPOINT []
+CMD ["mineru", "--help"]

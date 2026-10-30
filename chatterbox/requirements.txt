@@ -1,0 +1,40 @@
+# =============================================================================
+# CHATTERBOX TTS AUDIOBOOK CONVERTER REQUIREMENTS
+# =============================================================================
+
+# PyTorch with CUDA 12.6 support (Pascal sm_60 / sm_61 compatible)
+--extra-index-url https://download.pytorch.org/whl/cu126
+torch>=2.8.0+cu126
+torchaudio>=2.8.0+cu126
+
+# Chatterbox core dependencies
+librosa>=0.11.0
+s3tokenizer>=0.3.0
+transformers>=5.2.0
+diffusers>=0.29.0
+conformer>=0.3.2
+safetensors>=0.5.3
+spacy-pkuseg>=1.0.1
+pykakasi>=2.3.0
+gradio>=6.8.0
+pyloudnorm>=0.2.0
+omegaconf>=2.3.0
+resemble-perth @ git+https://github.com/resemble-ai/Perth.git@master
+
+# Audio I/O & Processing
+numpy>=1.24.0,<2.0.0
+soundfile>=0.12.1
+pydub>=0.25.1
+
+# CLI Progress & Logging
+rich>=13.7.0
+
+# EPUB & LaTeX Processing (mineru_to_epub.py)
+ebooklib>=0.20
+latex2mathml>=3.81.0
+markdown>=3.7
+beautifulsoup4>=4.13.0
+lxml>=5.0.0
+
+# Server & ABS Upload (upload_to_abs.py)
+requests>=2.31.0

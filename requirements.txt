@@ -1,0 +1,55 @@
+# Kokoro-82M TTS
+kokoro
+misaki[en]>=0.9.4
+
+# Model runtime
+# Pinned to 2.7.1+cu126: this machine's GPUs (2x Tesla P100, 1x Quadro P1000)
+# are Pascal (CC 6.0/6.1). PyTorch dropped Pascal kernels starting with the
+# cu128 builds (torch 2.8+), so newer/unpinned installs fail on this hardware.
+--extra-index-url https://download.pytorch.org/whl/cu126
+torch==2.7.1+cu126
+
+# Audio I/O
+soundfile>=0.12.1
+numpy>=1.24.0
+pydub>=0.25.1
+
+# CLI progress bars / ETA
+rich>=13.7.0
+
+# Note: ffmpeg is required by pydub for mp3/m4a export.
+#   Debian/Ubuntu: sudo apt-get install ffmpeg espeak-ng
+#   espeak-ng is only needed as a G2P fallback / for non-English languages.
+
+# EPUB & LaTeX Processing (mineru_to_epub.py)
+ebooklib>=0.20
+latex2mathml>=3.81.0
+markdown>=3.7
+beautifulsoup4>=4.13.0
+pillow>=11.0.0
+
+
+
+#MINERU dependencies
+
+anyio==4.14.2
+certifi==2026.7.22
+click==8.4.2
+filelock==3.32.2
+fsspec==2026.7.0
+h11==0.16.0
+hf-xet==1.6.0
+httpcore==1.0.9
+httpx==0.28.1
+huggingface_hub==1.26.0
+idna==3.18
+packaging==26.3
+PyYAML==6.0.3
+tqdm==4.70.0
+typing_extensions==4.16.0
+
+#TTS_Script dependencies
+markdown-it-py
+mdit-py-plugins
+linkify-it-py
+num2words

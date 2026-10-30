@@ -1,0 +1,167 @@
+# MinerU on Podman
+#
+# Profiles:
+#   batch  -> CPU extraction, pipeline backend, no GPU        (86.47)
+#   api    -> long-running HTTP service on :8000, CPU         (86.47)
+#   vlm    -> llama.cpp on Pascal + MinerU client             (95.30, unverified)
+#   client -> MinerU client only, against a remote VLM server (95.30)
+#
+# Nothing starts unless you name a profile.
+
+networks:
+  mineru-net:
+
+volumes:
+  mineru-models:
+
+# ---------------------------------------------------------------------------
+# Shared config. YAML anchors, so podman-compose expands them before it runs.
+# ---------------------------------------------------------------------------
+x-mineru-common: &mineru-common
+  build:
+    context: .
+    dockerfile: Dockerfile.cpu
+    args:
+      MINERU_VERSION: ${MINERU_VERSION:-}
+  image: localhost/mineru-cpu:latest
+  security_opt:
+    - label=disable
+  networks: [mineru-net]
+  shm_size: "8gb"
+
+x-mineru-env: &mineru-env
+  MINERU_MODEL_SOURCE: ${MINERU_MODEL_SOURCE:-huggingface}
+  HF_HOME: /models/hf
+  MINERU_TOOLS_CONFIG_JSON: /models/mineru.json
+  OMP_NUM_THREADS: ${MINERU_THREADS:-8}
+  MKL_NUM_THREADS: ${MINERU_THREADS:-8}
+  MINERU_INTRA_OP_NUM_THREADS: ${MINERU_THREADS:-8}
+  MINERU_INTER_OP_NUM_THREADS: "1"
+  MINERU_PDF_RENDER_THREADS: "4"
+  MINERU_FORMULA_ENABLE: "true"
+  MINERU_TABLE_ENABLE: "true"
+
+services:
+
+  # =========================================================================
+  # PROFILE: batch -- CPU pipeline backend. Works everywhere. Baseline.
+  #   podman compose --profile batch run --rm mineru-batch
+  # =========================================================================
+  mineru-batch:
+    <<: *mineru-common
+    profiles: ["batch"]
+    container_name: mineru-batch
+    environment:
+      <<: *mineru-env
+      CUDA_VISIBLE_DEVICES: ""
+    volumes:
+      - ${IN_DIR:-./in}:/data/in:ro,z
+      - ${OUT_DIR:-./out}:/data/out:z
+      - mineru-models:/models:z
+    command: >
+      mineru
+      -p /data/in
+      -o /data/out
+      -b pipeline
+      -m ${MINERU_METHOD:-txt}
+
+  # =========================================================================
+  # PROFILE: api -- persistent CPU HTTP service.  http://localhost:8000/docs
+  # =========================================================================
+  mineru-api:
+    <<: *mineru-common
+    profiles: ["api"]
+    container_name: mineru-api
+    restart: unless-stopped
+    ports:
+      - "${API_PORT:-8000}:8000"
+    environment:
+      <<: *mineru-env
+      CUDA_VISIBLE_DEVICES: ""
+      MINERU_API_OUTPUT_ROOT: /data/out
+      MINERU_API_MAX_CONCURRENT_REQUESTS: "${API_CONCURRENCY:-2}"
+      MINERU_TASK_RESULT_TIMEOUT_SECONDS: "${MINERU_TASK_RESULT_TIMEOUT_SECONDS:-21600}"
+    volumes:
+      - ${OUT_DIR:-./out}:/data/out:z
+      - mineru-models:/models:z
+    command: ["mineru-api", "--host", "0.0.0.0", "--port", "8000"]
+
+  # =========================================================================
+  # PROFILE: vlm -- llama.cpp serving MinerU2.5 GGUF on the P100s.
+  # UNSUPPORTED UPSTREAM. See runbook Part 1.6 before assuming it works.
+  #   podman compose --profile vlm up -d llamacpp
+  # =========================================================================
+  llamacpp:
+    profiles: ["vlm"]
+    build:
+      context: .
+      dockerfile: Containerfile.llamacpp
+      args:
+        CUDA_ARCH: ${CUDA_ARCH:-60}
+    image: localhost/llamacpp-pascal:latest
+    container_name: llamacpp
+    restart: unless-stopped
+    devices:
+      - nvidia.com/gpu=all
+    security_opt:
+      - label=disable
+    networks: [mineru-net]
+    ports:
+      - "${VLM_PORT:-30000}:30000"
+    volumes:
+      - ${GGUF_DIR:-./models/gguf}:/models:z
+    environment:
+      CUDA_VISIBLE_DEVICES: "${GPU_IDS:-0}"
+    # Greedy decoding, no repeat penalty. Both matter -- see runbook 1.6.
+    # DRY sampling was tried (2026-07-28) to suppress repetition-loop truncations,
+    # but it corrupted structured tag tokens on long runs (e.g. "equATION_footnote")
+    # and eventually triggered a hard 500 "does not match expected peg-native
+    # format" from llama-server, killing an entire 4.5h/640-page task outright.
+    # A soft per-page truncation warning is recoverable; a mid-task 500 that
+    # loses the whole document is not. Reverted to the RunBook-validated
+    # no-penalty baseline -- do not re-add repeat-penalty or DRY here without
+    # re-reading runbook 1.6.
+    command: >
+      --model /models/${GGUF_FILE}
+      --mmproj /models/${MMPROJ_FILE}
+      --alias ${VLM_MODEL_NAME:-MinerU2.5-2509-1.2B}
+      --host 0.0.0.0
+      --port 30000
+      --n-gpu-layers 99
+      --ctx-size 16384
+      --parallel 1
+      --temp 0.0
+      --top-k 1
+      --repeat-penalty 1.0
+      --special
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:30000/health || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 15
+      start_period: 180s
+
+  # =========================================================================
+  # PROFILE: vlm / client -- MinerU pointed at an OpenAI-compatible VLM server.
+  # Same image as the CPU batch job; only the backend flag differs.
+  #   podman compose --profile client run --rm mineru-vlm
+  # =========================================================================
+  mineru-vlm:
+    <<: *mineru-common
+    profiles: ["vlm", "client"]
+    container_name: mineru-vlm
+    environment:
+      <<: *mineru-env
+      CUDA_VISIBLE_DEVICES: ""
+      MINERU_VL_MODEL_NAME: ${VLM_MODEL_NAME:-MinerU2.5-2509-1.2B}
+      MINERU_TASK_RESULT_TIMEOUT_SECONDS: "${MINERU_TASK_RESULT_TIMEOUT_SECONDS:-21600}"
+    volumes:
+      - ${IN_DIR:-./in}:/data/in:ro,z
+      - ${OUT_DIR:-./out}:/data/out:z
+      - mineru-models:/models:z
+    command: >
+      mineru
+      -p /data/in
+      -o /data/out
+      -b vlm-http-client
+      -u ${VLM_URL:-http://llamacpp:30000}

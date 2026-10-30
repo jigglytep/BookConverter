@@ -1,0 +1,49 @@
+FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 AS build
+
+ARG CUDA_ARCH=60
+ARG LLAMA_CPP_REF=master
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git cmake build-essential libcurl4-openssl-dev ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# libcuda.so comes from the driver, not the toolkit. The devel image ships a
+# link-time stub named libcuda.so, but its SONAME is libcuda.so.1, so ld cannot
+# resolve the transitive dependency. Create the missing name.
+# LIBRARY_PATH (link time), NOT LD_LIBRARY_PATH -- the stub must never be
+# reachable at runtime or it will shadow the real driver library.
+RUN ln -sf /usr/local/cuda/lib64/stubs/libcuda.so \
+           /usr/local/cuda/lib64/stubs/libcuda.so.1
+ENV LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LIBRARY_PATH}
+
+WORKDIR /src
+RUN git clone --depth=1 --branch "${LLAMA_CPP_REF}" \
+        https://github.com/ggml-org/llama.cpp.git .
+
+RUN cmake -B build \
+        -DGGML_CUDA=ON \
+        -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCH}" \
+        -DLLAMA_CURL=ON \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs -lcuda" \
+        -DCMAKE_SHARED_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs -lcuda" \
+    && cmake --build build --config Release -j "$(nproc)" \
+        --target llama-server llama-cli
+
+# ---------------------------------------------------------------------------
+# Runtime stage. The stub is deliberately NOT copied -- the real libcuda.so.1
+# is injected by CDI from the host driver at run time.
+
+FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgomp1 libcurl4 curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /src/build/bin/llama-server /usr/local/bin/
+COPY --from=build /src/build/bin/llama-cli    /usr/local/bin/
+COPY --from=build /src/build/bin/*.so         /usr/local/lib/
+RUN ldconfig
+
+EXPOSE 30000
+ENTRYPOINT ["/usr/local/bin/llama-server"]

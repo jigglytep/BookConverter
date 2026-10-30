@@ -1,0 +1,3 @@
+num2words
+# Optional dependencies:
+# soundfile (required if running stream_worker.py with --synthesize)

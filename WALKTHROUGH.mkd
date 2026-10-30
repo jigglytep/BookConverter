@@ -1,0 +1,90 @@
+# Walkthrough: Automated PDF to Audiobook Conversion Pipeline
+
+We have created and verified a unified pipeline orchestrator ([`auto_pipeline.sh`](auto_pipeline.sh) / [`auto_convert.sh`](auto_convert.sh)) that automates PDF to audiobook conversion across all three existing stages: MinerU OCR, TTS_Script Markdown Stripper, and Chatterbox TTS with AudioBookshelf upload.
+
+---
+
+## Changes Made
+
+### 1. Unified Pipeline Orchestrator ([`auto_pipeline.sh`](auto_pipeline.sh))
+- **Sequential Pipeline**: Processes one PDF at a time through:
+  1. [`mineru/batch_fast.sh`](mineru/batch_fast.sh) &rarr; extracts rich markdown to `mineru/out/${book}_md`.
+  2. [`TTS_Script/batch_fast.sh`](TTS_Script/batch_fast.sh) &rarr; strips markdown into clean speech-ready plain text at `TTS_Script/out/${book}_txt`.
+  3. [`chatterbox/batch_fast.sh`](chatterbox/batch_fast.sh) &rarr; synthesizes `.m4b` audiobook with chapter markers, creates `.epub` companion ebook, and uploads both directly to AudioBookshelf.
+- **PID Concurrency Lock**:
+  - Uses `logs/auto_pipeline.lock` to ensure multiple manual runs or CRON schedules never run concurrently and collide over GPU VRAM. If another instance is running, it exits cleanly (code `0`). Stale locks from crashed processes are automatically detected and replaced.
+- **File Stability & Ingestion Checks**:
+  - Automatically filters out AppleDouble files (`._*`) and dotfiles.
+  - Verifies non-empty file (`-s`) and checks `%PDF` magic bytes.
+  - Verifies file size is stable before moving to prevent ingesting files currently being copied.
+- **Backlog Draining**:
+  - Automatically checks `mineru/out/` and `TTS_Script/out/` on startup to finish processing any books that already completed OCR before pulling new PDFs from `in/` (can be disabled via `--no-drain`).
+- **Flexible Invocation**:
+  - Can convert all PDFs in `in/`, or a single specific PDF (`./auto_pipeline.sh in/my_book.pdf`).
+  - Supports `--dry-run`, `--no-drain`, `--stop-on-error`, `--skip-upload`, `--skip-epub`, `--model {standard,turbo}`, and `--workers <N>`.
+
+### 2. Convenience Symlink ([`auto_convert.sh`](auto_convert.sh))
+- Created executable symlink `auto_convert.sh -> auto_pipeline.sh`.
+
+### 3. Crontab Configuration Guide ([`cron_example.txt`](cron_example.txt))
+- Documented sample recurring schedules for `crontab -e` (e.g. running every 30 minutes with stdout/stderr logged to `logs/cron.log`).
+
+### 4. Cleaned 0-Byte Corrupt File
+- Removed empty file `Basic_Electrical_and_Electronics_Engineering.pdf` from `mineru/in/` to ensure clean initial state.
+
+---
+
+## Verification Results
+
+### 1. Syntax Validation
+- Ran `bash -n auto_pipeline.sh`: passed with code 0 (no syntax errors).
+
+### 2. CLI Help & Argument Handling
+- Executed `./auto_pipeline.sh --help`: displays clear usage instructions, argument explanations, and command examples.
+
+### 3. Backlog & Queue Detection (`--dry-run`)
+- Executed `./auto_pipeline.sh --dry-run`:
+  - Successfully identified the **4 pending MinerU markdown folders** in `mineru/out/`:
+    - `AI and Machine Learning for Coders..._md`
+    - `AI and ML for Coders in PyTorch..._md`
+    - `Essential Math for AI..._md`
+    - `The Lazy Dungeon Master..._md`
+  - Successfully identified the **5 candidate PDFs** in `in/`:
+    - `DD Mortes Planar Parade...pdf`
+    - `Dungeons and Dragons DND 5E - Vecna Dossier...pdf`
+    - `Dungeons  Dragons Vecna Eve of Ruin...pdf`
+    - `Grim Hollow The Campaign Guide...pdf`
+    - `Monsters of the City Sins  Virtues...pdf`
+- Tested `--no-drain`: successfully skipped backlog check and proceeded directly to the PDF queue.
+- Tested specific PDF targeting via `./auto_convert.sh "in/Dungeons and Dragons DND 5E - Vecna Dossier...pdf" --no-drain --dry-run`: processed strictly that single file.
+
+### 4. Concurrency Protection & Stale Lock Recovery
+- **Active PID Lock Test**: Created background process with active PID in `logs/auto_pipeline.lock` &rarr; running `./auto_pipeline.sh` correctly logged:
+  `[INFO] Another pipeline instance is actively running (PID: 1740558). Exiting cleanly to avoid GPU collision.` and exited code `0`.
+- **Stale Lock Test**: Placed dead PID `999999` in `logs/auto_pipeline.lock` &rarr; `./auto_pipeline.sh` correctly reported:
+  `[WARN] Removing stale lockfile (previous PID: 999999 not running).` and proceeded with execution.
+
+---
+
+## Quick Usage Guide
+
+### Manual Run (All Books in `in/`)
+```bash
+./auto_convert.sh
+```
+
+### Dry Run (Preview Pending Queue)
+```bash
+./auto_convert.sh --dry-run
+```
+
+### Process Single Specific PDF
+```bash
+./auto_convert.sh "in/MyBook.pdf"
+```
+
+### Setup Recurring Automation via CRON
+Add to `crontab -e`:
+```cron
+*/30 * * * * /path/to/BookConverters/auto_pipeline.sh >> /path/to/BookConverters/logs/cron.log 2>&1
+```

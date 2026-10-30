@@ -1,0 +1,128 @@
+# Implementation Plan: Automated PDF to Audiobook Pipeline
+
+## Goal Description
+Create a clean, robust, and automated pipeline script ([`auto_pipeline.sh`](auto_pipeline.sh)) that orchestrates the three existing conversion stages in `/path/to/BookConverters`:
+1. **Stage 1 (MinerU OCR)**: Ingests a PDF from [in/](in/) into [mineru/in/](mineru/in/) and runs [`mineru/batch_fast.sh`](mineru/batch_fast.sh).
+2. **Stage 2 (TTS Markdown Stripper)**: Runs [`TTS_Script/batch_fast.sh`](TTS_Script/batch_fast.sh) to clean and strip markdown into Kokoro/Chatterbox-ready plain text page files.
+3. **Stage 3 (Chatterbox TTS & AudioBookshelf)**: Runs [`chatterbox/batch_fast.sh`](chatterbox/batch_fast.sh) to synthesize high-quality `.m4b` audiobooks with chapter markers, generate companion `.epub` ebooks, and upload both directly to AudioBookshelf with automatic library scanning.
+
+The script runs in **batch execution mode** (designed to be run manually or triggered by a **CRON job**). It processes all pending PDFs in `in/` one-by-one through the full pipeline, exits cleanly when complete, and uses a strict PID lockfile to ensure recurring CRON jobs never overlap or collide on GPU resources.
+
+---
+
+## User Review Required
+
+> [!IMPORTANT]
+> **Pre-existing files in pipeline**:
+> 1. In [mineru/out/](mineru/out/), there are currently **4 completed OCR books** from earlier runs (`AI and ML for Coders in PyTorch`, `AI and Machine Learning for Coders`, `Essential Math for AI`, `The Lazy Dungeon Master`).
+> 2. In [mineru/in/](mineru/in/), there is a leftover **0-byte empty file** (`Basic_Electrical_and_Electronics_Engineering.pdf`), which would cause `mineru/batch_fast.sh` to fail if not cleaned up.
+>
+> **Proposed Behavior**:
+> - The pipeline will automatically remove or quarantine 0-byte corrupt files before starting.
+> - By default, the pipeline will feature a **backlog draining phase** on startup: if books are already sitting in `mineru/out/` or `TTS_Script/out/`, it will complete stages 2 & 3 for them before pulling new PDFs from `in/`, avoiding duplicate OCR compute. (Can be disabled with `--no-drain`).
+
+> [!NOTE]
+> **Single-Book Sequential Flow**:
+> The pipeline processes **one PDF at a time** through Stages 1 &rarr; 2 &rarr; 3 &rarr; AudioBookshelf upload. This minimizes disk space usage (temporary page images and audio chunks are cleaned up per book), provides early delivery into AudioBookshelf as each book finishes, and ensures failures on one book do not block others.
+
+---
+
+## Proposed Changes
+
+```mermaid
+flowchart TD
+    Start(["auto_pipeline.sh invoked (Manual or CRON)"]) --> LockCheck{"Acquire PID Lock?<br/>(logs/auto_pipeline.lock)"}
+    LockCheck -- "Already Running" --> ExitLock["Exit 0 immediately (Avoid GPU collision)"]
+    LockCheck -- "Acquired" --> CleanMineru["Pre-flight: Clean 0-byte files in mineru/in/"]
+    
+    CleanMineru --> CheckBacklog{"Backlog in mineru/out or TTS_Script/out?"}
+    CheckBacklog -- Yes --> DrainBacklog["Run Stage 2 & Stage 3 on Backlog"]
+    CheckBacklog -- No --> CheckIn{"PDFs in in/ ?"}
+    DrainBacklog --> CheckIn
+    
+    CheckIn -- "No PDFs in in/" --> Summary["Print Summary, Release Lock, Exit 0"]
+    CheckIn -- "Found PDFs" --> PickOne["Pick next PDF from in/<br/>(Validate file stability & %PDF header)"]
+    
+    PickOne --> MoveToMineru["Move PDF -> mineru/in/"]
+    MoveToMineru --> Stage1["Stage 1: mineru/batch_fast.sh"]
+    
+    Stage1 -- Success --> Stage2["Stage 2: TTS_Script/batch_fast.sh"]
+    Stage1 -- Failure --> Quarantine1["Move PDF to failed/ & Log Error"]
+    Quarantine1 --> NextBook{"More PDFs?"}
+    
+    Stage2 -- Success --> Stage3["Stage 3: chatterbox/batch_fast.sh<br/>(TTS .m4b + EPUB + AudioBookshelf Upload)"]
+    Stage2 -- Failure --> Quarantine2["Log Stage 2 Failure"]
+    Quarantine2 --> NextBook
+    
+    Stage3 -- Success --> HardlinkCompleted["Link mineru/completed/PDF -> completed/PDF"]
+    Stage3 -- Failure --> Quarantine3["Log Stage 3 Failure"]
+    
+    HardlinkCompleted --> NextBook
+    Quarantine3 --> NextBook
+    NextBook -- Yes --> PickOne
+    NextBook -- No --> Summary
+```
+
+---
+
+### Core Pipeline Orchestrator
+
+#### [NEW] [`auto_pipeline.sh`](auto_pipeline.sh)
+
+A clean, robust bash orchestrator created in `/path/to/BookConverters/auto_pipeline.sh` (with executable permissions `chmod +x`).
+
+**Key Responsibilities & Features**:
+- **PID File Lock (`logs/auto_pipeline.lock`)**:
+  - Uses `flock` / PID checks. If an existing run is in progress (e.g. from a prior CRON trigger or manual run), the new invocation exits cleanly without error or GPU contention.
+- **File Stability & Validation Check**:
+  - Excludes macOS AppleDouble files (`._*`) and dotfiles (`.*`).
+  - Verifies non-empty file (`-s`) and validates `%PDF` header bytes.
+  - Ensures file is not still being copied into `in/` (verifies file size is stable across a 2-second sampling window).
+- **Sequential 3-Stage Execution**:
+  1. Move selected PDF `in/MyBook.pdf` &rarr; `mineru/in/MyBook.pdf`.
+  2. Invoke `mineru/batch_fast.sh`. Verifies `mineru/out/MyBook_md` was created. Moves finished PDF to `completed/`.
+  3. Invoke `TTS_Script/batch_fast.sh mineru/out/MyBook_md`. Verifies `TTS_Script/out/MyBook_txt` was created.
+  4. Invoke `chatterbox/batch_fast.sh TTS_Script/out/MyBook_txt`. Synthesizes `.m4b`, produces `.epub`, uploads to AudioBookshelf, and triggers library scan.
+- **Backlog Draining**: Checks for unprocessed folders in `mineru/out/` and `TTS_Script/out/` on startup and processes them through stages 2 & 3.
+- **Clean Exit**: Exits code 0 when all PDFs in `in/` are processed (or when `in/` is empty).
+- **Error Quarantine**:
+  - Failed PDFs are moved to `failed/` with failure logs in `logs/pipeline_failures.txt` so they do not block subsequent books.
+- **Pass-through Arguments**:
+  - Supports `--skip-upload`, `--skip-epub`, `--model {standard,turbo}`, `--stop-on-error`, `--dry-run`, etc.
+- **Graceful Termination**:
+  - Traps `SIGINT` (`Ctrl+C`) and `SIGTERM` to safely release the lock and clean up.
+
+---
+
+### Convenience Symlinks & CRON Example
+
+#### [NEW] [`auto_convert.sh`](auto_convert.sh)
+Symlink pointing to `auto_pipeline.sh` for convenient manual invocation.
+
+#### [NEW] [`cron_example.txt`](cron_example.txt)
+Reference crontab example for running periodically (e.g. every 15 or 30 minutes, or nightly):
+```cron
+# Run audiobook conversion pipeline every 30 minutes
+# Lockfile prevents duplicate runs if a previous conversion is still running.
+*/30 * * * * /path/to/BookConverters/auto_pipeline.sh >> /path/to/BookConverters/logs/cron.log 2>&1
+```
+
+---
+
+## Verification Plan
+
+### Automated Tests
+1. **Syntax & Lint Validation**:
+   - Run `bash -n auto_pipeline.sh` to ensure syntax is clean.
+2. **Help & Flag Parsing Test**:
+   - Run `./auto_pipeline.sh --help` to verify usage output.
+   - Run `./auto_pipeline.sh --dry-run` to verify directory scanning and queue identification without modifying files.
+3. **Locking Mechanism Test**:
+   - Start an instance and verify a second invocation immediately detects the active lock and exits cleanly (code 0).
+
+### Manual Verification
+1. **Backlog Processing Test**:
+   - Run `./auto_pipeline.sh --drain-backlog --dry-run` to verify it correctly identifies the 4 existing books in `mineru/out/`.
+2. **End-to-End Test**:
+   - Run `./auto_pipeline.sh` on a test book or queue.
+   - Verify smooth handover: `in/` &rarr; `mineru` &rarr; `TTS_Script` &rarr; `chatterbox` &rarr; AudioBookshelf &rarr; `completed/`.
