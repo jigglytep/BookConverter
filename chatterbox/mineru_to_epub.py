@@ -986,6 +986,10 @@ def preprocess_text(text: str, is_plain_text: bool = False) -> str:
     text = re.sub(r"(\b[a-zA-Z]{2,})-\s*\n\s*([a-zA-Z]{2,}\b)", r"\1\2", text)
     # Clean OCR sub/sup letter artifacts e.g. <sub>p</sub>lanar -> planar
     text = re.sub(r"<(?:sub|sup)>([a-zA-Z,;'\"]+)</(?:sub|sup)>", r"\1", text)
+    # Separate fused OCR uppercase words and numbers e.g. CHAPTER1 -> CHAPTER 1
+    text = re.sub(r"\b([A-Z]{3,})(\d+)\b", r"\1 \2", text)
+    # Convert leading Unicode bullets into standard Markdown list items outside code fences
+    text = re.sub(r"(?m)^(\s*)[•◦▪▫▸▹►▻❖➢➣➤]\s+", r"\1- ", text)
 
     if not is_plain_text:
         return text
@@ -1027,25 +1031,146 @@ def _default_md_tts_opts():
     return _Opts()
 
 
+# Known spoken initialisms that should remain uppercase (and use "'s" when pluralized)
+_KNOWN_INITIALISMS = {
+    "RPG", "TTRPG", "GM", "DM", "NPC", "PC", "AI", "HP", "XP", "MP", "DC", "AC",
+    "AP", "CR", "HD", "AOE", "DOT", "DPS", "PVP", "PVE", "RNG", "LARP", "RAW",
+    "RAI", "BBEG", "TPK", "STR", "DEX", "CON", "INT", "WIS", "CHA", "AM", "PM",
+    "AD", "BC", "BCE", "CE", "US", "USA", "UK", "EU", "UN", "TV", "ID", "OK",
+    "DIY", "FAQ", "PDF", "URL", "URI", "USB", "CPU", "GPU", "RAM", "ROM", "API",
+    "UI", "UX", "OS", "IO", "IP", "TCP", "UDP", "HTTP", "HTTPS", "HTML", "XML",
+    "JSON", "YAML", "SQL", "CSS", "FPS", "HUD", "VR", "AR", "XR", "SFX", "VFX",
+    "CGI", "DJ", "MC", "VIP", "CEO", "CFO", "CTO", "COO", "HR", "PR", "QA", "RD",
+    "IT", "IQ", "EQ", "DNA", "RNA", "EKG", "ECG", "EEG", "MRI", "CT", "ER", "ICU",
+    "IV", "UV", "IR", "RF", "EM", "LED", "LCD", "OLED", "NASA", "NATO", "FBI",
+    "CIA", "NSA", "ATF", "DEA", "DOJ", "DOD", "EPA", "FDA", "FCC", "FTC", "IRS",
+    "SEC", "SOS", "ETA", "TBD", "TBA", "FYI", "ASAP", "RSVP", "PS", "AKA", "AWOL",
+    "MIA", "POW", "KIA", "DOA", "RIP", "ATM", "PIN", "VIN", "SSN", "LLC", "INC",
+    "LTD", "PLC", "DBA", "EST", "PST", "CST", "MST", "EDT", "PDT", "CDT", "MDT",
+    "GMT", "UTC", "DVD", "CD", "VHS", "FM", "SSR", "SR", "UR",
+}
+
+_ROMAN_NUMERAL_RE = re.compile(
+    r"^(?:M{0,3})(?:CM|CD|D?C{0,3})(?:XC|XL|L?X{0,3})(?:IX|IV|V?I{0,3})$"
+)
+
+# Common English function/emphasis words that sound best in lowercase when de-caps-locked mid-sentence
+_LOWERCASE_DECAPS_WORDS = {
+    "A", "AN", "AND", "ARE", "AS", "AT", "BE", "BEEN", "BUT", "BY", "CAN", "DO",
+    "DOES", "DID", "FOR", "FROM", "HAD", "HAS", "HAVE", "HE", "HER", "HERE",
+    "HIM", "HIS", "HOW", "IF", "IN", "INTO", "IS", "IT", "ITS", "JUST", "MAY",
+    "ME", "MIGHT", "MORE", "MOST", "MUST", "MY", "NO", "NOR", "NOT", "NOW", "OF",
+    "OFF", "ON", "ONCE", "ONE", "ONLY", "OR", "OTHER", "OUR", "OUT", "OVER",
+    "OWN", "SAME", "SHE", "SHOULD", "SO", "SOME", "SUCH", "THAN", "THAT", "THE",
+    "THEIR", "THEM", "THEN", "THERE", "THESE", "THEY", "THIS", "THOSE", "THROUGH",
+    "TO", "TOO", "TWO", "THREE", "FOUR", "FIVE", "SIX", "SEVEN", "EIGHT", "NINE",
+    "TEN", "UNDER", "UNTIL", "UP", "UPON", "US", "VERY", "WAS", "WE", "WERE",
+    "WHAT", "WHEN", "WHERE", "WHICH", "WHILE", "WHO", "WHOM", "WHY", "WILL",
+    "WITH", "WITHIN", "WITHOUT", "WOULD", "YES", "YET", "YOU", "YOUR", "ALL",
+    "ANY", "BOTH", "EACH", "FEW",
+}
+
+_UNICODE_BULLETS_RE = re.compile(r"[•◦▪▫▸▹►▻⦿⦾★☆✓✔✗✘❖➢➣➤✦✧♦♢♣♠♥]+")
+
+
+def _expand_editorial_abbreviations(text: str) -> str:
+    """Expand structural/editorial abbreviations (p., pp., Ch., Fig., vs., e.g., i.e., etc., lvl) before number verbalization."""
+    text = re.sub(r"\b([A-Za-z]{3,})(\d+)\b", r"\1 \2", text)
+    text = re.sub(r"\bpp\.\s*(\d+)\s*[-–—]\s*(\d+)\b", r"pages \1 to \2", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bpp\.\s*(\d+)\b", r"pages \1", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bp\.\s*(\d+)\b", r"page \1", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bCh\.\s*(\d+)\b", r"Chapter \1", text)
+    text = re.sub(r"\bSec\.\s*(\d+)\b", r"Section \1", text)
+    text = re.sub(r"\bFigs\.\s*(\d+)\b", r"Figures \1", text)
+    text = re.sub(r"\bFig\.\s*(\d+)\b", r"Figure \1", text)
+    text = re.sub(r"\bTabs\.\s*(\d+)\b", r"Tables \1", text)
+    text = re.sub(r"\bTab\.\s*(\d+)\b", r"Table \1", text)
+    text = re.sub(r"\blvl\.?\s*(\d+)\b", r"level \1", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bvs\.(?=\s|$)", "versus", text, flags=re.IGNORECASE)
+    text = re.sub(r"\be\.g\.(?=[,\s]|$)", "for example", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bi\.e\.(?=[,\s]|$)", "that is", text, flags=re.IGNORECASE)
+    text = re.sub(r"\betc\.(?=[,\s\)\]\'\"]|$)", "et cetera", text, flags=re.IGNORECASE)
+    return text
+
+
+def sanitize_spoken_for_tts(text: str) -> str:
+    """
+    Sanitize verbalized spoken text for Chatterbox TTS:
+    1. Strips Unicode bullets/symbols that map to [UNK] in EnTokenizer.
+    2. Strips leading dashes/hyphens/punctuation (e.g. '—The System AI' -> 'The System AI').
+    3. Preserves known initialisms (RPG, GM, NPC, AI) and formats plurals as RPG's, GM's, NPC's.
+    4. Converts non-initialism ALL-CAPS words (CHAPTER, ATLAS, TOOLS, WILL, YOU) to normal
+       Title/lowercase so EnTokenizer uses subword tokens instead of spelling individual letters.
+    """
+    if not text:
+        return ""
+
+    # 0. Strip any [pause:...] control tags so they are never spoken aloud as words
+    text = re.sub(r"\[\s*pause\s*:\s*[^\]]*\]", " ", text, flags=re.IGNORECASE)
+
+    # 1. Remove Unicode bullet/decorative glyphs
+    text = _UNICODE_BULLETS_RE.sub(" ", text)
+
+    # 2. Separate any remaining fused uppercase word + digits (e.g. CHAPTER1 -> CHAPTER 1)
+    text = re.sub(r"\b([A-Za-z]{3,})(\d+)\b", r"\1 \2", text)
+
+    # 3. Strip leading dashes, bullets, or orphan punctuation at the start of the chunk
+    text = re.sub(r"^[\s\-\u2010-\u2015•◦▪▫▸▹►▻,:;.!?/\\|]+", "", text)
+
+    # 4. Normalize plural initialisms (e.g. RPGs -> RPG's, GMs -> GM's, NPCs -> NPC's)
+    def _repl_plural_initialism(m: re.Match) -> str:
+        stem = m.group(1)
+        if stem in _KNOWN_INITIALISMS:
+            return f"{stem}'s"
+        return m.group(0)
+
+    text = re.sub(r"\b([A-Z]{2,6})s\b", _repl_plural_initialism, text)
+
+    # 5. Convert non-initialism ALL-CAPS words (2+ uppercase letters) to natural casing
+    def _repl_allcaps_word(m: re.Match) -> str:
+        word = m.group(0)
+        start_pos = m.start()
+        if word in _KNOWN_INITIALISMS:
+            return word
+        if len(word) >= 2 and _ROMAN_NUMERAL_RE.match(word) and word not in ("MIX", "DIM", "LID", "MID", "VIM", "ILL", "MILL", "CIVIL", "LIVID", "VIVID", "MILD", "WILD", "CHILD"):
+            # Keep valid standalone Roman numerals (II, III, IV, VI..XX) except common English words
+            if word in ("II", "III", "IV", "VI", "VII", "VIII", "IX", "XI", "XII", "XIII", "XIV", "XV", "XVI", "XVII", "XVIII", "XIX", "XX"):
+                return word
+
+        # Check if word is at start of string or immediately after sentence/colon punctuation
+        prefix = text[:start_pos].rstrip()
+        is_sentence_start = (not prefix) or prefix[-1] in ".!?:;\"'“”("
+        if not is_sentence_start and word in _LOWERCASE_DECAPS_WORDS:
+            return word.lower()
+        return word.capitalize()
+
+    text = re.sub(r"\b[A-Z]{2,}\b", _repl_allcaps_word, text)
+    # Also lowercase mid-sentence single-letter article 'A' (not following sentence-ending punctuation)
+    text = re.sub(r"(?<=[a-zA-Z0-9,;])\s+\bA\b(?=\s+[A-Za-z])", " a", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
 def verbalize_for_tts(raw_fragment: str, md_opts=None, md_stats: Optional[dict] = None) -> str:
     """Convert a Markdown/HTML fragment (with LaTeX math, numbers, tables, units) into spoken TTS text."""
+    pre_cleaned = re.sub(r"\[\s*pause\s*:\s*[^\]]*\]", " ", raw_fragment, flags=re.IGNORECASE)
+    pre_cleaned = _UNICODE_BULLETS_RE.sub(" ", pre_cleaned)
+    pre_cleaned = _expand_editorial_abbreviations(pre_cleaned)
     if md_tts is not None:
         if md_opts is None:
             md_opts = _default_md_tts_opts()
         if md_stats is None:
             md_stats = {"equations": 0, "converted": 0, "errors": 0}
         try:
-            spoken = md_tts.process(raw_fragment, md_opts, md_stats).strip()
-            spoken = re.sub(r"\s+", " ", spoken).strip()
-            return spoken
+            spoken = md_tts.process(pre_cleaned, md_opts, md_stats).strip()
+            return sanitize_spoken_for_tts(spoken)
         except Exception as e:
             logger.debug("md_tts fallback on fragment: %s", e)
 
     # Fallback basic cleanup if md_tts is unavailable
-    txt = re.sub(r"<[^>]+>", " ", raw_fragment)
+    txt = re.sub(r"<[^>]+>", " ", pre_cleaned)
     txt = html.unescape(txt)
-    txt = re.sub(r"\s+", " ", txt).strip()
-    return txt
+    return sanitize_spoken_for_tts(txt)
 
 
 # Protect abbreviations before sentence splitting so periods in "e.g.", "Mr.", "Fig. 1" don't split sentences
@@ -1068,6 +1193,10 @@ def _split_balanced_html_sentences(inner_html: str, max_words: int = 24, math_pr
 
     # Find top-level (tag_depth == 0, outside <...>) split positions
     void_tags = {"br", "img", "hr", "input", "meta", "link"}
+    min_standalone_words = 6
+
+    def _count_plain_words(fragment: str) -> int:
+        return len(re.sub(r"<[^>]+>", " ", fragment).split())
 
     def _find_balanced_splits(text: str, delimiter_chars: str) -> List[str]:
         parts: List[str] = []
@@ -1126,28 +1255,14 @@ def _split_balanced_html_sentences(inner_html: str, max_words: int = 24, math_pr
             parts.append(tail)
         return parts if parts else [text]
 
-    def _split_long_balanced_segment(seg: str, limit: int) -> List[str]:
-        # First try splitting on clause delimiters (, ; : — –)
-        clauses = _find_balanced_splits(seg, ",;:\u2014\u2013")
-        if len(clauses) > 1:
-            grouped: List[str] = []
-            curr = ""
-            curr_w = 0
-            for cl in clauses:
-                w = len(re.sub(r"<[^>]+>", " ", cl).split())
-                if curr and curr_w + w > limit:
-                    grouped.append(curr.strip())
-                    curr = cl
-                    curr_w = w
-                else:
-                    curr = (curr + " " + cl).strip() if curr else cl
-                    curr_w += w
-            if curr:
-                grouped.append(curr.strip())
-            if all(len(re.sub(r"<[^>]+>", " ", g).split()) <= limit * 1.3 for g in grouped):
-                return grouped
+    def _split_by_balanced_words(seg: str, limit: int) -> List[str]:
+        total_w = _count_plain_words(seg)
+        if total_w <= limit:
+            return [seg]
+        # Choose balanced target words per part so we never leave a tiny <6 word tail
+        num_parts = max(2, (total_w + limit - 1) // limit)
+        target_w = max(min_standalone_words, (total_w + num_parts - 1) // num_parts)
 
-        # Otherwise split on top-level whitespace every `limit` words
         words_out: List[str] = []
         tag_depth = 0
         in_tag = False
@@ -1175,7 +1290,8 @@ def _split_balanced_html_sentences(inner_html: str, max_words: int = 24, math_pr
                         word_count += 1
                 else:
                     in_word = False
-                    if tag_depth == 0 and word_count >= limit:
+                    rem_words = _count_plain_words(seg[i:])
+                    if tag_depth == 0 and word_count >= target_w and rem_words >= min_standalone_words:
                         j = i
                         while j < n and seg[j].isspace():
                             j += 1
@@ -1192,21 +1308,58 @@ def _split_balanced_html_sentences(inner_html: str, max_words: int = 24, math_pr
             words_out.append(rem)
         return words_out if words_out else [seg]
 
+    def _split_long_balanced_segment(seg: str, limit: int) -> List[str]:
+        # First try splitting on clause delimiters (, ; : — –)
+        clauses = _find_balanced_splits(seg, ",;:\u2014\u2013")
+        if len(clauses) > 1:
+            grouped: List[str] = []
+            curr = ""
+            curr_w = 0
+            for cl in clauses:
+                w = _count_plain_words(cl)
+                # Never strand a tiny introductory clause (< 6 words) on its own
+                if curr and curr_w >= min_standalone_words and (curr_w + w > limit):
+                    grouped.append(curr.strip())
+                    curr = cl
+                    curr_w = w
+                else:
+                    curr = (curr + " " + cl).strip() if curr else cl
+                    curr_w += w
+            if curr:
+                # If trailing clause is < 6 words, attach it to previous group
+                if grouped and curr_w < min_standalone_words:
+                    grouped[-1] = f"{grouped[-1]} {curr.strip()}"
+                else:
+                    grouped.append(curr.strip())
+
+            # Sub-split any grouped clause that is still overly long (> limit + 4)
+            final_groups: List[str] = []
+            for g in grouped:
+                gw = _count_plain_words(g)
+                if gw > limit + 4:
+                    final_groups.extend(_split_by_balanced_words(g, limit))
+                else:
+                    final_groups.append(g)
+            if final_groups:
+                return final_groups
+
+        return _split_by_balanced_words(seg, limit)
+
     raw_sentences = _find_balanced_splits(s, ".!?")
     expanded_sentences: List[str] = []
     for sent in raw_sentences:
-        approx_words = len(re.sub(r"<[^>]+>", " ", sent).split())
+        approx_words = _count_plain_words(sent)
         if approx_words > max_words:
             expanded_sentences.extend(_split_long_balanced_segment(sent, max_words))
         else:
             expanded_sentences.append(sent)
 
     # Keep sentences >= 6 words as individual read-along spans; merge tiny fragments (< 6 words)
-    min_standalone_words = 6
     grouped_chunks: List[Tuple[str, str]] = []
     curr_html_parts: List[str] = []
     curr_spoken_parts: List[str] = []
     curr_words = 0
+    soft_merge_limit = max_words + min_standalone_words
 
     for sent_html in expanded_sentences:
         tts_input = math_processor.restore_tokens_for_tts(sent_html) if math_processor else sent_html
@@ -1222,10 +1375,14 @@ def _split_balanced_html_sentences(inner_html: str, max_words: int = 24, math_pr
             continue
 
         s_words = len(spoken.split())
-        if curr_html_parts and (curr_words < min_standalone_words or s_words < min_standalone_words) and (curr_words + s_words <= max_words):
+        if curr_html_parts and (curr_words < min_standalone_words or s_words < min_standalone_words) and (curr_words + s_words <= soft_merge_limit):
             curr_html_parts.append(sent_html)
             curr_spoken_parts.append(spoken)
             curr_words += s_words
+        elif s_words < min_standalone_words and grouped_chunks and not curr_html_parts and (len(grouped_chunks[-1][1].split()) + s_words <= soft_merge_limit):
+            prev_h, prev_s = grouped_chunks[-1]
+            grouped_chunks[-1] = (prev_h + " " + sent_html, prev_s + " " + spoken)
+            continue
         else:
             if curr_html_parts:
                 grouped_chunks.append((" ".join(curr_html_parts), " ".join(curr_spoken_parts)))
@@ -1240,11 +1397,44 @@ def _split_balanced_html_sentences(inner_html: str, max_words: int = 24, math_pr
             curr_words = 0
 
     if curr_html_parts:
-        if grouped_chunks and curr_words < min_standalone_words and (len(grouped_chunks[-1][1].split()) + curr_words <= max_words + 4):
+        if grouped_chunks and curr_words < min_standalone_words and (len(grouped_chunks[-1][1].split()) + curr_words <= soft_merge_limit):
             prev_h, prev_s = grouped_chunks[-1]
             grouped_chunks[-1] = (prev_h + " " + " ".join(curr_html_parts), prev_s + " " + " ".join(curr_spoken_parts))
         else:
             grouped_chunks.append((" ".join(curr_html_parts), " ".join(curr_spoken_parts)))
+
+    # Enforce minimum 20-character sentence rule (Chatterbox-TTS-Extended / Issue #97):
+    # If a sentence is below 20 characters, merge it with the sentence after or before it.
+    min_chars = 20
+    max_chars = 300
+    if len(grouped_chunks) > 1:
+        merged_short: List[Tuple[str, str]] = []
+        idx = 0
+        while idx < len(grouped_chunks):
+            cur_h, cur_s = grouped_chunks[idx]
+            cur_s_clean = cur_s.strip()
+            if len(cur_s_clean) >= min_chars:
+                merged_short.append((cur_h, cur_s_clean))
+                idx += 1
+            else:
+                appended = False
+                if idx + 1 < len(grouped_chunks):
+                    nxt_h, nxt_s = grouped_chunks[idx + 1]
+                    nxt_s_clean = nxt_s.strip()
+                    if len(cur_s_clean + " " + nxt_s_clean) <= max_chars:
+                        merged_short.append((f"{cur_h} {nxt_h}", f"{cur_s_clean} {nxt_s_clean}"))
+                        idx += 2
+                        appended = True
+                if not appended and merged_short:
+                    prev_h, prev_s = merged_short[-1]
+                    if len(prev_s + " " + cur_s_clean) <= max_chars:
+                        merged_short[-1] = (f"{prev_h} {cur_h}", f"{prev_s} {cur_s_clean}")
+                        idx += 1
+                        appended = True
+                if not appended:
+                    merged_short.append((cur_h, cur_s_clean))
+                    idx += 1
+        grouped_chunks = merged_short
 
     return grouped_chunks
 

@@ -25,6 +25,9 @@ resemble-perth @ git+https://github.com/resemble-ai/Perth.git@master
 numpy>=1.24.0,<2.0.0
 soundfile>=0.12.1
 pydub>=0.25.1
+auto-editor>=29.0.0
+faster-whisper>=1.1.0
+openai-whisper>=20240930
 
 # CLI Progress & Logging
 rich>=13.7.0

@@ -43,12 +43,24 @@ def main():
                 name = torch.cuda.get_device_name(i)
                 free_b, tot_b = torch.cuda.mem_get_info(i)
                 alloc_b = torch.cuda.memory_allocated(i)
+                used_b = tot_b - free_b
+                used_pct = (used_b / tot_b * 100.0) if tot_b > 0 else 0.0
+                try:
+                    from audiobook_tts import calculate_gpu_available_space
+                    cap = calculate_gpu_available_space(f"cuda:{i}")
+                    cap_line = (
+                        f"  Chatterbox Cap. : +{cap['additional_instances']} additional instance(s) can fit "
+                        f"(effective free: {cap['effective_free_mib']:.0f} MiB, needed: {cap['required_mib']:.0f} MiB)\n"
+                    )
+                except Exception:
+                    cap_line = ""
                 print(
                     f"GPU {i} [{name}]:\n"
                     f"  Total Memory    : {tot_b / 1e9:6.2f} GB\n"
-                    f"  Free Memory     : {free_b / 1e9:6.2f} GB\n"
-                    f"  In-Use Memory   : {(tot_b - free_b) / 1e9:6.2f} GB\n"
+                    f"  Free Memory     : {free_b / 1e9:6.2f} GB ({100.0 - used_pct:.1f}%)\n"
+                    f"  In-Use Memory   : {used_b / 1e9:6.2f} GB ({used_pct:.1f}%)\n"
                     f"  PyTorch Allocated: {alloc_b / 1e9:6.2f} GB\n"
+                    f"{cap_line}"
                 )
     except ImportError:
         print("PyTorch is not installed in the current environment.\n")

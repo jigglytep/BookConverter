@@ -74,6 +74,9 @@ show_help() {
   echo "Chatterbox TTS Options (forwarded directly to audiobook_tts.py):"
   echo "  --model {standard,turbo}"
   echo "  --devices <devices>     Comma-separated device list (e.g. 'cuda:0,cuda:1')"
+  echo "  --auto-scale-gpu        Automatically add worker instances per GPU based on free VRAM (default)"
+  echo "  --no-auto-scale-gpu     Disable automatic multi-instance GPU scaling"
+  echo "  --max-instances-per-gpu Max worker instances per GPU when auto-scaling"
   echo "  --reference-id <id>     Preset reference voice ID"
   echo "  --reference-audio <path>Path to reference audio for voice cloning"
   echo "  --temperature <val>     Sampling temperature"
@@ -275,6 +278,18 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --devices=*)
+      tts_args+=("$1")
+      shift
+      ;;
+    --auto-scale-gpu|--no-auto-scale-gpu)
+      tts_args+=("$1")
+      shift
+      ;;
+    --max-instances-per-gpu)
+      tts_args+=("--max-instances-per-gpu" "$2")
+      shift 2
+      ;;
+    --max-instances-per-gpu=*)
       tts_args+=("$1")
       shift
       ;;

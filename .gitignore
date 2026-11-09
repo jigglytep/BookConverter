@@ -19,6 +19,7 @@ failed/
 *.pyc
 # *.md
 logs/
+chatterbox/chatterbox_repo/
 models/
 *.metadata.json
 */__pycache__/

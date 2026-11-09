@@ -107,6 +107,8 @@ Options:
   --model <model>        Chatterbox TTS model: standard, turbo (default: standard)
   --reference-id <id>    Chatterbox preset reference voice ID (e.g. practical_engineering)
   --reference-audio <f>  Path to reference audio WAV for voice cloning
+  --backend <backend>    MinerU backend: hybrid-http-client, vlm-http-client, pipeline (default: hybrid-http-client)
+  --method <method>      MinerU parse method: auto, txt, ocr (default: auto)
   --workers <N>          Worker count forwarded to mineru/batch_fast.sh
   --plain                Non-TTY / unattended mode: line-per-event + periodic progress heartbeat
   --quiet, -q            Suppress routine INFO/DEBUG lines in status display
@@ -204,6 +206,22 @@ while [[ $# -gt 0 ]]; do
       mineru_forward_args+=("$1")
       shift
       ;;
+    --backend|-b)
+      mineru_forward_args+=("--backend" "$2")
+      shift 2
+      ;;
+    --backend=*)
+      mineru_forward_args+=("$1")
+      shift
+      ;;
+    --method|-m)
+      mineru_forward_args+=("--method" "$2")
+      shift 2
+      ;;
+    --method=*)
+      mineru_forward_args+=("$1")
+      shift
+      ;;
     --plain|--quiet|-q|--verbose|-v)
       display_args+=("$1")
       shift
@@ -276,17 +294,24 @@ acquire_lock() {
   fi
 }
 
-# Clean any 0-byte corrupt files in mineru/in
+# Clean any 0-byte corrupt files in mineru/in and restore interrupted staged PDFs to in/
 clean_mineru_in() {
   shopt -s nullglob
-  local corrupted=("$MINERU_DIR/in"/*)
+  local staged=("$MINERU_DIR/in"/*)
   shopt -u nullglob
 
-  for item in "${corrupted[@]}"; do
+  for item in "${staged[@]}"; do
     if [[ -f "$item" && ! -s "$item" ]]; then
       log WARN "Removing empty (0-byte) file in mineru/in/: $(basename "$item")"
       if [[ "$DRY_RUN" == "false" ]]; then
         rm -f "$item"
+      fi
+    elif [[ -f "$item" && "$CLEAN_IN_PROGRESS" == "false" && ("$item" == *.pdf || "$item" == *.PDF) ]]; then
+      local bname_pdf
+      bname_pdf="$(basename "$item")"
+      log INFO "Restoring previously interrupted Stage 1 PDF from mineru/in/ -> in/${bname_pdf}"
+      if [[ "$DRY_RUN" == "false" ]]; then
+        mv "$item" "${IN_DIR}/${bname_pdf}"
       fi
     fi
   done
@@ -468,6 +493,12 @@ drain_backlog() {
       continue
     fi
 
+    # If the source PDF is still queued in in/ or mineru/in/, Stage 1 is incomplete and will resume in the main queue
+    if [[ -f "${IN_DIR}/${book_name}.pdf" || -f "${IN_DIR}/${book_name}.PDF" || -f "${MINERU_DIR}/in/${book_name}.pdf" || -f "${MINERU_DIR}/in/${book_name}.PDF" ]]; then
+      log INFO "Skipping partially extracted '${folder_name}' in backlog drain (Stage 1 will resume from in/${book_name}.pdf)."
+      continue
+    fi
+
     log INFO "Found pending TTS text folder: ${folder_name}"
 
     if [[ "$DRY_RUN" == "true" ]]; then
@@ -508,6 +539,12 @@ drain_backlog() {
       if [[ "$DRY_RUN" == "false" ]]; then
         mark_book_completed "$book_name"
       fi
+      continue
+    fi
+
+    # If the source PDF is still queued in in/ or mineru/in/, Stage 1 is incomplete and will resume in the main queue
+    if [[ -f "${IN_DIR}/${book_name}.pdf" || -f "${IN_DIR}/${book_name}.PDF" || -f "${MINERU_DIR}/in/${book_name}.pdf" || -f "${MINERU_DIR}/in/${book_name}.PDF" ]]; then
+      log INFO "Skipping partially extracted '${folder_name}' in backlog drain (Stage 1 will resume from in/${book_name}.pdf)."
       continue
     fi
 
@@ -630,12 +667,21 @@ process_single_pdf() {
   local mineru_target="${MINERU_DIR}/in/${pdf_filename}"
   mv "$pdf" "$mineru_target"
 
-  local s1_start s1_end s1_dur
+  local s1_start s1_end s1_dur s1_rc
   s1_start=$(date +%s)
 
-  if ! bash "${MINERU_DIR}/batch_fast.sh" "${mineru_forward_args[@]}"; then
+  bash "${MINERU_DIR}/batch_fast.sh" "${mineru_forward_args[@]}"
+  s1_rc=$?
+  if [[ $s1_rc -ne 0 ]]; then
     s1_end=$(date +%s)
     s1_dur=$((s1_end - s1_start))
+    if [[ $s1_rc -eq 130 || $s1_rc -eq 143 ]]; then
+      log WARN "Pipeline interrupted during Stage 1 for ${pdf_filename}. Restoring to ${IN_DIR}/."
+      if [[ -f "$mineru_target" ]]; then
+        mv "$mineru_target" "${IN_DIR}/${pdf_filename}"
+      fi
+      exit "$s1_rc"
+    fi
     log ERROR "MinerU OCR failed for ${pdf_filename} after $(format_duration "$s1_dur")."
     if [[ -f "$mineru_target" ]]; then
       log WARN "Quarantining ${pdf_filename} -> ${FAILED_DIR}/"

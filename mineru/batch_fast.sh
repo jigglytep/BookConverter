@@ -92,7 +92,12 @@ for pdf in "${pdf_files[@]}"; do
   fi
 
   # Execute fast_split_and_process.py with passed flags (e.g. --workers, --backend, --method)
-  if python3 scripts/fast_split_and_process.py "$pdf" "$@"; then
+  python3 scripts/fast_split_and_process.py "$pdf" "$@"
+  split_rc=$?
+  if [[ $split_rc -eq 130 || $split_rc -eq 143 ]]; then
+    echo ">>> Interrupted (exit code ${split_rc}). Exiting cleanly." >&2
+    exit "$split_rc"
+  elif [[ $split_rc -eq 0 ]]; then
     # Sanity check: Ensure markdown files were actually produced before moving the PDF
     if [ -d "$out_md_dir" ] && find "$out_md_dir" -maxdepth 1 -name "*.md" -print -quit | grep -q .; then
       echo "--------------------------------------------------------------------------------"

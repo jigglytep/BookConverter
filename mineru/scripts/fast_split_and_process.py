@@ -331,14 +331,21 @@ def ensure_servers_running(repo_dir: Path, ui: DevOpsUI) -> bool:
         healthy, latency = check_server_health(port)
 
         if not healthy:
-            ui.log(f"{ui.ICON_WARN} {service} (: {port}) is offline. Starting container via podman-compose...")
-            subprocess.run(
-                ["podman-compose", "--profile", "vlm", "up", "-d", service],
-                cwd=str(repo_dir),
+            ui.log(f"{ui.ICON_WARN} {service} (: {port}) is offline. Starting container...")
+            start_res = subprocess.run(
+                ["podman", "start", service],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 check=False,
             )
+            if start_res.returncode != 0:
+                subprocess.run(
+                    ["podman-compose", "--profile", "vlm", "up", "-d", service],
+                    cwd=str(repo_dir),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
             if wait_for_server(port, max_wait=45):
                 healthy, latency = check_server_health(port)
                 status_str = f"ONLINE ({latency:.1f}ms)"
@@ -493,6 +500,8 @@ def run_workers(
             *volumes,
             "-e", "HF_HOME=/models/hf",
             "-e", "MINERU_TOOLS_CONFIG_JSON=/models/mineru.json",
+            "-e", f"MINERU_VL_MODEL_NAME={os.environ.get('VLM_MODEL_NAME', 'MinerU2.5-2509-1.2B')}",
+            "-e", f"MINERU_TASK_RESULT_TIMEOUT_SECONDS={os.environ.get('MINERU_TASK_RESULT_TIMEOUT_SECONDS', '43200')}",
             "-e", "OMP_NUM_THREADS=10",
             "-e", "MKL_NUM_THREADS=10",
             "-e", "MINERU_INTRA_OP_NUM_THREADS=10",
@@ -693,9 +702,9 @@ def main() -> int:
     parser.add_argument("pdf", type=Path, help="Path to input PDF file (e.g. in/book.pdf)")
     parser.add_argument(
         "-b", "--backend",
-        default="pipeline",
+        default="hybrid-http-client",
         choices=["pipeline", "vlm-http-client", "hybrid-http-client"],
-        help="MinerU backend: 'pipeline' (YOLO layout + digital text), 'vlm-http-client' (VLM vision OCR), 'hybrid-http-client' (VLM layout + digital text) [default: pipeline]",
+        help="MinerU backend: 'pipeline' (YOLO layout + digital text), 'vlm-http-client' (VLM vision OCR), 'hybrid-http-client' (VLM layout + digital text) [default: hybrid-http-client]",
     )
     parser.add_argument(
         "-m", "--method",
