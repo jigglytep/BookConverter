@@ -1,11 +1,11 @@
-# Chatterbox TTS Audiobook & Document Toolkit
+# Qwen3-TTS & Chatterbox TTS Audiobook & Document Toolkit
 
-A high-fidelity audiobook creation and document processing pipeline powered by **Chatterbox TTS** (Resemble AI). Converts documents and OCR outputs (such as **MinerU / magic-pdf**) into **EPUB3 ebooks with MathML**, synthesizes natural audiobooks with **zero-shot voice cloning and dual-GPU parallel acceleration**, and uploads both to **Audiobookshelf**.
+A high-fidelity audiobook creation and document processing pipeline powered by **Qwen3-TTS** (default, running in `/mnt/raid0/qwen/src/tts-env`) with a built-in toggle to switch back to **Chatterbox TTS** (Resemble AI). Converts documents and OCR outputs (such as **MinerU / magic-pdf**) into **EPUB3 ebooks with MathML**, synthesizes natural audiobooks with **zero-shot voice cloning (`practical_engineering` reference voice) and dual-GPU FP16 parallel acceleration on NVIDIA Tesla P100s (`sm_60`)**, and uploads both to **Audiobookshelf**.
 
 ```
 books/*.pdf  ──mineru/magic-pdf──>  Markdown + LaTeX + Images
-                                       ├──>  mineru_to_epub.py  ──>  Book.epub (MathML + Images) ──┐
-                                       └──>  audiobook_tts.py   ──>  Book.m4b (Chatterbox TTS)   ──┴──>  upload_to_abs.py  ──>  Audiobookshelf
+                                       ├──>  mineru_to_epub.py  ──>  Book.epub (MathML + Images) ────────┐
+                                       └──>  audiobook_tts.py   ──>  Book.m4b (Qwen3-TTS / Chatterbox) ──┴──>  upload_to_abs.py  ──>  Audiobookshelf
 ```
 
 ---
@@ -59,6 +59,11 @@ python3 audiobook_tts.py mybook.txt --reference-audio sample.wav
 
 # 6. List available reference voices:
 python3 audiobook_tts.py --list-references
+
+# 7. Toggle between Qwen3-TTS (default) and Chatterbox TTS:
+python3 audiobook_tts.py /path/to/txt_pages/ --tts-engine qwen3       # Default (Qwen3-TTS 1.7B Base FP16)
+python3 audiobook_tts.py /path/to/txt_pages/ --tts-engine chatterbox  # Fallback to Chatterbox TTS FP16
+TTS_ENGINE=chatterbox ./batch_fast.sh /path/to/txt_pages/             # Toggle via environment variable
 ```
 
 > **Note on Automatic Cleanup**: As soon as chunk synthesis completes (and before FFmpeg container encoding begins), `audiobook_tts.py` automatically shuts down all GPU worker processes, deletes the model from memory, and purges PyTorch CUDA cache (`empty_cache` + `ipc_collect`). If `--clean-chunks` is passed, it also removes intermediate WAV files once the audiobook is assembled.
@@ -71,11 +76,14 @@ Central configuration is stored in [`config.py`](config.py):
 
 | Parameter | Default | Description |
 |:---|:---|:---|
-| `MODEL_TYPE` | `"standard"` | `"standard"` (500M) or `"turbo"` (350M) |
+| `TTS_ENGINE` | `"qwen3"` | Active TTS engine: `"qwen3"` (default) or `"chatterbox"` |
+| `QWEN_TTS_ENV` | `"/mnt/raid0/qwen/src/tts-env"` | Dedicated Qwen3-TTS virtualenv on RAID0 |
+| `DEFAULT_REFERENCE_ID` | `"practical_engineering"` | Default zero-shot voice clone reference (`practical_engineering.wav` + `.lab`) |
+| `MODEL_TYPE` | `"standard"` | `"standard"` (`Qwen3-TTS-12Hz-1.7B-Base` / Chatterbox 500M) or `"turbo"` (`0.6B` / 350M) |
 | `SAMPLE_RATE` | `24000` | Audio output sample rate (24 kHz) |
-| `DEVICES` | `["cuda:0", "cuda:1"]` | Multi-GPU worker allocation |
-| `CHUNK_SIZE_WORDS` | `50` | Target words per chunk |
-| `CHUNK_GAP_MS` | `250` | Silence gap (ms) between chunks |
+| `DEVICES` | `["cuda:0", "cuda:1"]` | Multi-GPU worker allocation (dual Tesla P100s in FP16) |
+| `CHUNK_SIZE_WORDS` | `24` | Target words per chunk |
+| `CHUNK_GAP_MS` | `180` | Silence gap (ms) between chunks |
 | `AUDIO_FORMAT` | `"m4b"` | Default export container |
 | `AUDIO_BITRATE` | `"192k"` | AAC/MP3 export bitrate |
 

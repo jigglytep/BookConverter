@@ -123,9 +123,10 @@ Orchestrated by [`chatterbox/batch_fast.sh`](chatterbox/batch_fast.sh), [`chatte
 1. **Dual-Stream DOM & Sentence Chunking (`mineru_to_epub.py`)**:
    - Parses the rich MinerU Markdown (preserving images, tables, and converting LaTeX formulas to native W3C **MathML 3** via `latex2mathml`).
    - Splits prose into ADHD-optimized ~24-word single-sentence chunks (`CHUNK_SIZE_WORDS = 24` in [`chatterbox/config.py`](chatterbox/config.py)), wrapping each visual chunk in `<span id="p{page}_s{seq}">...</span>` inside `OEBPS/text/page_{num}.xhtml` while pairing it with its normalized spoken string for TTS.
-2. **Multi-GPU Chatterbox TTS Synthesis (`audiobook_tts.py`)**:
-   - Spawns parallel worker processes across `cuda:0` and `cuda:1` running Resemble AI's **Chatterbox TTS** (`standard` 500M or `turbo` 350M model at 24 kHz) with zero-shot voice cloning.
-   - Trims leading/trailing dead air from each synthesized chunk and caches every WAV chunk by MD5 hash in `chatterbox/cache/audio_chunks/` for instant resume.
+2. **Multi-GPU Qwen3-TTS & Chatterbox TTS Synthesis (`audiobook_tts.py`)**:
+   - Uses **Qwen3-TTS** (`Qwen/Qwen3-TTS-12Hz-1.7B-Base` in `/mnt/raid0/qwen/src/tts-env`) as the default TTS engine across `cuda:0` and `cuda:1` via standard PyTorch FP16 (`torch.float16`) and SDPA attention optimized for dual NVIDIA Tesla P100 GPUs (`sm_60`), cloning the `practical_engineering` reference voice (`practical_engineering.wav` + `practical_engineering.lab`).
+   - Supports an instant configuration/CLI toggle (`TTS_ENGINE=chatterbox` or `--tts-engine chatterbox` / `--chatterbox`) to switch back to Resemble AI's **Chatterbox TTS** (`standard` 500M or `turbo` 350M model at 24 kHz in FP16 CUDA).
+   - Trims leading/trailing dead air from each synthesized chunk and caches every WAV chunk by engine-namespaced MD5 hash in `chatterbox/cache/audio_chunks/` for instant resume.
    - Automatically shuts down GPU workers and frees VRAM before FFmpeg encoding begins.
 3. **Sample-Accurate SMIL 3.0 Media Overlays & Audio Assembly**:
    - Computes exact `clipBegin` and `clipEnd` timestamps directly from raw 24 kHz PCM sample counts (`len(samples) / 24000`) plus `180ms` inter-chunk silence padding before any lossy encoding, guaranteeing **zero timing drift** across multi-hour books.

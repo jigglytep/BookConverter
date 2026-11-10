@@ -3,19 +3,56 @@ import os
 import sys
 from pathlib import Path
 
-# Automatically re-execute inside .venv if invoked with system python
+# Default HuggingFace cache to RAID0 storage to avoid filling the 15 GB root partition (/)
+os.environ.setdefault("HF_HOME", "/mnt/raid0/qwen/huggingface")
+
+
+def _detect_requested_engine(argv: list[str]) -> str:
+    """Detect requested TTS engine ('qwen3' default or 'chatterbox') before venv re-exec."""
+    engine = os.environ.get("TTS_ENGINE", "qwen3").strip().lower()
+    for i, arg in enumerate(argv):
+        if arg in ("--tts-engine", "--engine") and i + 1 < len(argv):
+            engine = argv[i + 1].strip().lower()
+        elif arg.startswith("--tts-engine=") or arg.startswith("--engine="):
+            engine = arg.split("=", 1)[1].strip().lower()
+        elif arg == "--chatterbox":
+            engine = "chatterbox"
+        elif arg in ("--qwen3", "--qwen"):
+            engine = "qwen3"
+    if engine in ("chatterbox", "chatterbox-tts", "chatterbox_tts", "cb"):
+        return "chatterbox"
+    return "qwen3"
+
+
+# Automatically re-execute inside the appropriate dedicated environment on RAID0
 _script_dir = Path(__file__).resolve().parent
-_venv_python = _script_dir / ".venv" / "bin" / "python3"
+_requested_engine = _detect_requested_engine(sys.argv[1:])
+_qwen_env_dir = Path(os.environ.get("QWEN_TTS_ENV", "/mnt/raid0/qwen/src/tts-env"))
+_qwen_python = _qwen_env_dir / "bin" / "python3"
+_chatterbox_python = _script_dir / ".venv" / "bin" / "python3"
+
+if _requested_engine == "qwen3" and _qwen_python.exists():
+    _target_python = _qwen_python
+    _target_site = _qwen_env_dir / "lib" / "python3.11" / "site-packages"
+else:
+    _target_python = _chatterbox_python if _chatterbox_python.exists() else _qwen_python
+    _target_site = _script_dir / ".venv" / "lib" / "python3.11" / "site-packages"
+
 if (
     __name__ == "__main__"
-    and _venv_python.exists()
-    and Path(sys.executable).resolve() != _venv_python.resolve()
+    and _target_python.exists()
+    and Path(sys.executable) != _target_python
 ):
-    os.execv(str(_venv_python), [str(_venv_python)] + sys.argv)
+    os.execv(str(_target_python), [str(_target_python)] + sys.argv)
 
-_venv_site = _script_dir / ".venv" / "lib" / "python3.11" / "site-packages"
-if _venv_site.exists() and str(_venv_site) not in sys.path:
-    sys.path.insert(0, str(_venv_site))
+if _target_site.exists() and str(_target_site) not in sys.path:
+    sys.path.insert(0, str(_target_site))
+for _fallback_site in (
+    _qwen_env_dir / "lib" / "python3.11" / "site-packages",
+    _script_dir / ".venv" / "lib" / "python3.11" / "site-packages",
+):
+    if _fallback_site.exists() and str(_fallback_site) not in sys.path:
+        sys.path.append(str(_fallback_site))
 
 """
 Chatterbox TTS Audiobook & Document Converter
@@ -192,31 +229,115 @@ def _worker_process_fn(
     task_queue: mp.Queue,
     result_queue: mp.Queue,
 ):
-    """Worker process running on a dedicated GPU/device."""
-    import sys
-    from pathlib import Path
-    _sdir = Path(__file__).resolve().parent
-    _vsite = _sdir / ".venv" / "lib" / "python3.11" / "site-packages"
-    if _vsite.exists() and str(_vsite) not in sys.path:
-        sys.path.insert(0, str(_vsite))
-    _rsrc = _sdir / "chatterbox_repo" / "src"
-    if str(_rsrc) not in sys.path:
-        sys.path.insert(0, str(_rsrc))
-
+    """Worker process running on a dedicated GPU/device (supports Qwen3-TTS and Chatterbox in FP16)."""
+    model = None
+    voice_clone_prompt = None
+    tts_engine = "qwen3"
+    is_cuda = False
+    ref_text = None
     try:
-        if model_type == "turbo":
-            from chatterbox.tts_turbo import ChatterboxTurboTTS
-            model = ChatterboxTurboTTS.from_pretrained(device=device)
+        os.environ.setdefault("HF_HOME", getattr(config, "HF_HOME", "/mnt/raid0/qwen/huggingface"))
+        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True,max_split_size_mb:128")
+        tts_engine = config.normalize_tts_engine(gen_kwargs.get("tts_engine", config.TTS_ENGINE))
+        ref_text = gen_kwargs.get("ref_text")
+
+        _sdir = Path(__file__).resolve().parent
+        _qsite = Path(getattr(config, "QWEN_TTS_ENV", "/mnt/raid0/qwen/src/tts-env")) / "lib" / "python3.11" / "site-packages"
+        _vsite = _sdir / ".venv" / "lib" / "python3.11" / "site-packages"
+        if tts_engine == "qwen3":
+            for p in (_qsite, _vsite):
+                if p.exists() and str(p) not in sys.path:
+                    sys.path.insert(0, str(p))
         else:
-            from chatterbox.tts import ChatterboxTTS
-            model = ChatterboxTTS.from_pretrained(device=device)
-        if ref_audio:
-            model.prepare_conditionals(
-                ref_audio,
-                exaggeration=gen_kwargs.get("exaggeration", 0.5),
+            for p in (_vsite, _qsite):
+                if p.exists() and str(p) not in sys.path:
+                    sys.path.insert(0, str(p))
+        _rsrc = _sdir / "chatterbox_repo" / "src"
+        if str(_rsrc) not in sys.path:
+            sys.path.insert(0, str(_rsrc))
+
+        is_cuda = str(device).startswith("cuda") and torch.cuda.is_available()
+        if is_cuda:
+            # Optimize for NVIDIA Tesla P100 (Pascal sm_60: standard FP16 CUDA paths, no TF32/bfloat16)
+            torch.backends.cuda.matmul.allow_tf32 = False
+            torch.backends.cudnn.allow_tf32 = False
+            torch.backends.cudnn.benchmark = True
+            try:
+                dev_idx = int(str(device).split(":")[1]) if ":" in str(device) else 0
+                torch.cuda.set_device(dev_idx)
+                w_per_gpu = int(gen_kwargs.get("workers_per_gpu", getattr(config, "WORKERS_PER_GPU", 3)))
+                if w_per_gpu >= 3:
+                    torch.cuda.set_per_process_memory_fraction(0.31, dev_idx)
+            except Exception:
+                pass
+
+        if tts_engine == "qwen3":
+            import gc
+            import transformers
+            transformers.logging.set_verbosity_error()
+            from qwen_tts import Qwen3TTSModel
+
+            qwen_model_id = gen_kwargs.get("qwen_model_id") or config.QWEN_MODEL_MAP.get(
+                str(model_type).lower(), config.QWEN_DEFAULT_MODEL
             )
+            target_dtype = torch.float16 if is_cuda else torch.float32
+            # Load on CPU first and cast speech_tokenizer from float32 -> float16 before moving to GPU
+            # to avoid a temporary float32 VRAM spike when 3 workers share a 16 GB P100.
+            model = Qwen3TTSModel.from_pretrained(
+                qwen_model_id,
+                device_map="cpu" if is_cuda else device,
+                dtype=target_dtype,
+                attn_implementation=getattr(config, "QWEN_ATTN_IMPLEMENTATION", "sdpa"),
+            )
+            st_model = None
+            if is_cuda:
+                if hasattr(model, "model") and model.model is not None:
+                    if hasattr(model.model, "speech_tokenizer") and model.model.speech_tokenizer is not None:
+                        st_model = getattr(model.model.speech_tokenizer, "model", None)
+                        if st_model is not None:
+                            st_model.to(dtype=torch.float16)
+                            st_model.to(device=device, dtype=torch.float16)
+                        model.model.speech_tokenizer.device = torch.device(device)
+                    model.model.to(device=device, dtype=torch.float16)
+                model.device = torch.device(device)
+            if ref_audio:
+                has_ref_text = bool(ref_text and str(ref_text).strip())
+                with torch.inference_mode(), torch.amp.autocast("cuda", dtype=torch.float16, enabled=is_cuda):
+                    voice_clone_prompt = model.create_voice_clone_prompt(
+                        ref_audio=ref_audio,
+                        ref_text=str(ref_text).strip() if has_ref_text else None,
+                        x_vector_only_mode=not has_ref_text,
+                    )
+                # Once voice_clone_prompt is cached, speaker_encoder and speech_tokenizer.encoder
+                # are never used again during chunk synthesis; free them to save ~400 MiB VRAM per worker.
+                if is_cuda and voice_clone_prompt is not None:
+                    if hasattr(model, "model") and model.model is not None:
+                        model.model.speaker_encoder = None
+                    if st_model is not None and hasattr(st_model, "encoder"):
+                        st_model.encoder = None
+                    gc.collect()
+                    torch.cuda.empty_cache()
+        else:
+            if model_type == "turbo":
+                from chatterbox.tts_turbo import ChatterboxTurboTTS
+                model = ChatterboxTurboTTS.from_pretrained(device=device)
+            else:
+                from chatterbox.tts import ChatterboxTTS
+                model = ChatterboxTTS.from_pretrained(device=device)
+            if ref_audio:
+                with torch.inference_mode(), torch.amp.autocast(
+                    "cuda",
+                    dtype=torch.float16,
+                    enabled=(is_cuda and getattr(config, "CHATTERBOX_FP16", True)),
+                ):
+                    model.prepare_conditionals(
+                        ref_audio,
+                        exaggeration=gen_kwargs.get("exaggeration", 0.5),
+                    )
+        if is_cuda:
+            torch.cuda.empty_cache()
     except Exception as e:
-        result_queue.put((-1, "init_error", f"Failed to load model on {device}: {e}"))
+        result_queue.put((-1, "init_error", f"Failed to load {tts_engine} model on {device}: {e}"))
         return
 
     result_queue.put((-1, "ready", device))
@@ -233,44 +354,71 @@ def _worker_process_fn(
                 chunk_file = Path(chunk_file_str)
 
                 # Check cache first
-                if cache_path.exists():
+                if not gen_kwargs.get("no_cache", False) and cache_path.exists():
                     shutil.copy2(cache_path, chunk_file)
                     num_words = len(text.split())
                     result_queue.put((chunk_idx, "cached", num_words, 0.0, device))
                     continue
 
-                # Synthesize (conditionals already prepared on worker init)
+                # Synthesize (voice clone prompt / conditionals already prepared on worker init)
                 t0 = time.time()
-                if model_type == "turbo":
-                    wav = model.generate(
-                        text,
-                        audio_prompt_path=None,
-                        exaggeration=gen_kwargs.get("exaggeration", 0.5),
-                    )
+                if tts_engine == "qwen3":
+                    has_ref_text = bool(ref_text and str(ref_text).strip())
+                    with torch.inference_mode(), torch.amp.autocast("cuda", dtype=torch.float16, enabled=is_cuda):
+                        wavs, model_sr = model.generate_voice_clone(
+                            text=text,
+                            language=gen_kwargs.get("language", getattr(config, "QWEN_LANGUAGE", "English")),
+                            voice_clone_prompt=voice_clone_prompt,
+                            ref_audio=None if voice_clone_prompt is not None else ref_audio,
+                            ref_text=None if voice_clone_prompt is not None else (str(ref_text).strip() if has_ref_text else None),
+                            x_vector_only_mode=not has_ref_text,
+                            temperature=gen_kwargs.get("temperature", 0.72),
+                            top_p=gen_kwargs.get("top_p", 0.95),
+                            repetition_penalty=gen_kwargs.get("repetition_penalty", 1.25),
+                            max_new_tokens=gen_kwargs.get("max_new_tokens", getattr(config, "MAX_NEW_TOKENS", 1000)),
+                        )
+                    wav_np = np.asarray(wavs[0], dtype=np.float32).squeeze()
                 else:
-                    wav = model.generate(
-                        text,
-                        audio_prompt_path=None,
-                        exaggeration=gen_kwargs.get("exaggeration", 0.5),
-                        cfg_weight=gen_kwargs.get("cfg_weight", 0.5),
-                        temperature=gen_kwargs.get("temperature", 0.8),
-                        top_p=gen_kwargs.get("top_p", 1.0),
-                        repetition_penalty=gen_kwargs.get("repetition_penalty", 1.2),
-                    )
+                    with torch.inference_mode(), torch.amp.autocast(
+                        "cuda",
+                        dtype=torch.float16,
+                        enabled=(is_cuda and getattr(config, "CHATTERBOX_FP16", True)),
+                    ):
+                        if model_type == "turbo":
+                            wav = model.generate(
+                                text,
+                                audio_prompt_path=None,
+                                exaggeration=gen_kwargs.get("exaggeration", 0.5),
+                            )
+                        else:
+                            wav = model.generate(
+                                text,
+                                audio_prompt_path=None,
+                                exaggeration=gen_kwargs.get("exaggeration", 0.5),
+                                cfg_weight=gen_kwargs.get("cfg_weight", 0.5),
+                                temperature=gen_kwargs.get("temperature", 0.8),
+                                top_p=gen_kwargs.get("top_p", 1.0),
+                                repetition_penalty=gen_kwargs.get("repetition_penalty", 1.2),
+                            )
+                    model_sr = model.sr
+                    wav_np = wav.squeeze().detach().cpu().numpy()
 
                 t_gen = time.time() - t0
-                # wav is torch tensor [1, N] or [N]
-                wav_np = wav.squeeze().detach().cpu().numpy()
-                wav_np = _clean_and_normalize_chunk_wav(wav_np, model.sr)
+                wav_np = _clean_and_normalize_chunk_wav(wav_np, model_sr)
 
-                # Ensure 16-bit PCM WAV
+                # Ensure 16-bit PCM WAV (write cache atomically so concurrent workers never read partial files)
                 cache_path.parent.mkdir(parents=True, exist_ok=True)
                 chunk_file.parent.mkdir(parents=True, exist_ok=True)
-                sf.write(str(chunk_file), wav_np, model.sr, subtype="PCM_16")
-                shutil.copy2(chunk_file, cache_path)
+                sf.write(str(chunk_file), wav_np, model_sr, subtype="PCM_16")
+                tmp_cache = cache_path.with_name(f".{cache_path.name}.{os.getpid()}.tmp")
+                shutil.copy2(chunk_file, tmp_cache)
+                os.replace(tmp_cache, cache_path)
+
+                if is_cuda and torch.cuda.memory_reserved(device) > 4700 * 1024 * 1024:
+                    torch.cuda.empty_cache()
 
                 num_words = len(text.split())
-                dur = len(wav_np) / model.sr
+                dur = len(wav_np) / model_sr
                 result_queue.put((chunk_idx, "synthesized", num_words, dur, device))
 
             except Exception as e:
@@ -278,13 +426,16 @@ def _worker_process_fn(
     finally:
         # Explicitly unload model and release GPU memory
         try:
+            del voice_clone_prompt
+        except Exception:
+            pass
+        try:
             del model
         except Exception:
             pass
         import gc
         gc.collect()
         try:
-            import torch
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 torch.cuda.ipc_collect()
@@ -293,7 +444,7 @@ def _worker_process_fn(
 
 
 class ChatterboxAudiobookGenerator:
-    """Text -> Audiobook synthesizer using Chatterbox TTS."""
+    """Text -> Audiobook synthesizer supporting Qwen3-TTS (default) and Chatterbox TTS (toggle)."""
 
     _SUPPORTED_AUDIO_FORMATS = ("m4b", "mp3", "wav", "m4a", "flac")
 
@@ -301,6 +452,7 @@ class ChatterboxAudiobookGenerator:
         self,
         reference_id: Optional[str] = None,
         reference_audio: Optional[str] = None,
+        reference_text: Optional[str] = None,
         model_type: Optional[str] = None,
         devices: Optional[List[str]] = None,
         temperature: Optional[float] = None,
@@ -309,29 +461,45 @@ class ChatterboxAudiobookGenerator:
         cfg_weight: Optional[float] = None,
         exaggeration: Optional[float] = None,
         no_cache: bool = False,
+        tts_engine: Optional[str] = None,
+        workers_per_gpu: Optional[int] = None,
     ):
+        self.tts_engine = config.normalize_tts_engine(tts_engine)
         self.reference_id = reference_id or config.DEFAULT_REFERENCE_ID
         self.reference_audio = reference_audio or config.DEFAULT_REFERENCE_AUDIO
+        self.reference_text = reference_text if reference_text is not None else getattr(config, "DEFAULT_REFERENCE_TEXT", None)
         self.model_type = model_type or config.MODEL_TYPE
+        self.qwen_model_id = config.QWEN_MODEL_MAP.get(
+            str(self.model_type).lower(),
+            str(self.model_type) if "/" in str(self.model_type) else config.QWEN_DEFAULT_MODEL,
+        )
         self.temperature = temperature if temperature is not None else config.TEMPERATURE
         self.top_p = top_p if top_p is not None else config.TOP_P
         self.repetition_penalty = repetition_penalty if repetition_penalty is not None else config.REPETITION_PENALTY
         self.cfg_weight = cfg_weight if cfg_weight is not None else config.CFG_WEIGHT
         self.exaggeration = exaggeration if exaggeration is not None else config.EXAGGERATION
         self.no_cache = no_cache
+        self.workers_per_gpu = max(1, int(workers_per_gpu if workers_per_gpu is not None else getattr(config, "WORKERS_PER_GPU", 3)))
 
-        # Setup devices
+        # Setup devices (expand unique GPUs by workers_per_gpu when appropriate)
         if devices:
-            self.devices = devices
+            base_devs = list(devices)
+            if workers_per_gpu is not None and len(base_devs) == len(set(base_devs)):
+                self.devices = base_devs * self.workers_per_gpu
+            else:
+                self.devices = base_devs
+        elif getattr(config, "GPU_DEVICES", None) and workers_per_gpu is not None:
+            self.devices = list(config.GPU_DEVICES) * self.workers_per_gpu
         elif config.DEVICES:
             self.devices = config.DEVICES if isinstance(config.DEVICES, list) else [config.DEVICES]
         else:
             if torch.cuda.is_available():
-                self.devices = [f"cuda:{i}" for i in range(torch.cuda.device_count())]
+                self.devices = [f"cuda:{i}" for i in range(torch.cuda.device_count())] * self.workers_per_gpu
             else:
                 self.devices = ["cpu"]
 
-        # Resolve reference audio
+        # Resolve reference audio & companion transcript (.lab / .txt)
+        ref_dir: Optional[Path] = None
         if not self.reference_audio and self.reference_id:
             ref_dir = Path(config.REFERENCES_FOLDER) / self.reference_id
             if not ref_dir.exists():
@@ -340,6 +508,24 @@ class ChatterboxAudiobookGenerator:
             if wavs:
                 self.reference_audio = str(wavs[0].resolve())
 
+        if self.reference_text and Path(str(self.reference_text)).is_file():
+            self.reference_text = self._read_text_file(Path(str(self.reference_text))).strip()
+        elif not self.reference_text and self.reference_audio:
+            wav_path = Path(self.reference_audio)
+            transcript_candidates = [
+                wav_path.with_suffix(".lab"),
+                wav_path.with_suffix(".txt"),
+            ]
+            if ref_dir and ref_dir.is_dir():
+                transcript_candidates.extend(sorted(ref_dir.glob("*.lab")))
+                transcript_candidates.extend(sorted(ref_dir.glob("*.txt")))
+            for cand in transcript_candidates:
+                if cand.is_file():
+                    txt_val = self._read_text_file(cand).strip()
+                    if txt_val:
+                        self.reference_text = txt_val
+                        break
+
         self.logger = self._setup_logging()
 
     def unload_model(self):
@@ -347,7 +533,6 @@ class ChatterboxAudiobookGenerator:
         import gc
         gc.collect()
         try:
-            import torch
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 torch.cuda.ipc_collect()
@@ -521,11 +706,23 @@ class ChatterboxAudiobookGenerator:
             elif self.reference_id:
                 ref_str = self.reference_id
             self._cached_ref_str = ref_str
+        if not hasattr(self, "_cached_ref_txt_hash"):
+            self._cached_ref_txt_hash = (
+                hashlib.md5(str(self.reference_text).strip().encode("utf-8")).hexdigest()[:12]
+                if self.reference_text
+                else "xvec"
+            )
 
-        key = (
-            f"chatterbox_{self.model_type}_{text}_{self._cached_ref_str}_{self.temperature}_"
-            f"{self.top_p}_{self.repetition_penalty}_{self.cfg_weight}_{self.exaggeration}"
-        )
+        if self.tts_engine == "chatterbox":
+            key = (
+                f"chatterbox_{self.model_type}_{text}_{self._cached_ref_str}_{self.temperature}_"
+                f"{self.top_p}_{self.repetition_penalty}_{self.cfg_weight}_{self.exaggeration}"
+            )
+        else:
+            key = (
+                f"qwen3_{self.qwen_model_id}_{text}_{self._cached_ref_str}_{self._cached_ref_txt_hash}_"
+                f"{self.temperature}_{self.top_p}_{self.repetition_penalty}"
+            )
         digest = hashlib.md5(key.encode("utf-8")).hexdigest()
         cache_dir = Path(config.CACHE_FOLDER)
         if not cache_dir.is_absolute() and not cache_dir.exists():
@@ -934,7 +1131,8 @@ class ChatterboxAudiobookGenerator:
         folder_label = input_path.stem if input_path.is_file() else input_path.name
         book_name = canonical_book_name(input_path)
         book_title = title or book_name
-        book_author = author or "Chatterbox TTS"
+        engine_label = "Qwen3-TTS" if self.tts_engine == "qwen3" else "Chatterbox TTS"
+        book_author = author or engine_label
         chunks_dir = Path(config.CHUNKS_FOLDER) / folder_label
         chunks_dir.mkdir(parents=True, exist_ok=True)
 
@@ -950,7 +1148,7 @@ class ChatterboxAudiobookGenerator:
         # Load Stage 1 book_metadata.json & cover.jpg (with automatic fallback extraction for backlog items)
         book_meta = load_or_extract_book_metadata(input_path, md_dir=resolved_md_dir)
         explicit_title = title if (title and title != book_name) else None
-        explicit_author = author if (author and author not in ("Chatterbox TTS", "MinerU")) else None
+        explicit_author = author if (author and author not in ("Qwen3-TTS", "Chatterbox TTS", "MinerU")) else None
         if explicit_title:
             book_title = explicit_title
         elif book_meta.get("title"):
@@ -968,16 +1166,22 @@ class ChatterboxAudiobookGenerator:
             else None
         )
 
+        active_model_display = (
+            f"{self.qwen_model_id} (FP16)"
+            if self.tts_engine == "qwen3"
+            else f"Chatterbox {self.model_type.upper()} (FP16)"
+        )
         console.print(
             Panel(
-                f"[bold cyan]Chatterbox TTS Audiobook & Synchronized EPUB3 Generator[/bold cyan]\n\n"
+                f"[bold cyan]{engine_label} Audiobook & Synchronized EPUB3 Generator[/bold cyan]\n\n"
                 f"• Input        : [yellow]{input_path}[/yellow]\n"
                 f"• DOM Source   : [yellow]{dom_source_path}[/yellow]\n"
                 f"• Audio Output : [green]{output_path}[/green]\n"
                 f"• EPUB3 Output : [green]{epub_output_path if not skip_epub else 'Skipped (--skip-epub)'}[/green]\n"
-                f"• Model        : [magenta]{self.model_type.upper()}[/magenta]\n"
+                f"• TTS Engine   : [bold magenta]{self.tts_engine.upper()}[/bold magenta]\n"
+                f"• Model        : [magenta]{active_model_display}[/magenta]\n"
                 f"• Devices      : [cyan]{', '.join(self.devices)}[/cyan]\n"
-                f"• Reference    : [blue]{self.reference_audio or 'Built-in Chatterbox Timbre'}[/blue]\n"
+                f"• Reference    : [blue]{self.reference_audio or f'Built-in {engine_label} Timbre'}[/blue]\n"
                 f"• Chunk Size   : {config.CHUNK_SIZE_WORDS} words\n"
                 f"• Sample Rate  : {config.SAMPLE_RATE} Hz",
                 title="[bold blue]Conversion Job[/bold blue]",
@@ -1086,6 +1290,13 @@ class ChatterboxAudiobookGenerator:
 
         # 3. Multi-GPU / Multi-Worker Parallel Synthesis
         gen_kwargs = {
+            "tts_engine": self.tts_engine,
+            "qwen_model_id": self.qwen_model_id,
+            "ref_text": self.reference_text,
+            "no_cache": self.no_cache,
+            "workers_per_gpu": self.workers_per_gpu,
+            "language": getattr(config, "QWEN_LANGUAGE", "English"),
+            "max_new_tokens": getattr(config, "MAX_NEW_TOKENS", 1000),
             "temperature": self.temperature,
             "top_p": self.top_p,
             "repetition_penalty": self.repetition_penalty,
@@ -1177,7 +1388,7 @@ class ChatterboxAudiobookGenerator:
                         pass
                 workers.clear()
                 self.unload_model()
-                console.print("[bold green]✓ Chatterbox model unloaded from memory and GPU VRAM released.[/bold green]")
+                console.print(f"[bold green]✓ {engine_label} model unloaded from memory and GPU VRAM released.[/bold green]")
 
         # 4. Sample-Accurate Per-Page Audio Assembly (CBR MP3) & SMIL 3.0 Media Overlays
         if _sdisp is not None:
@@ -1251,7 +1462,7 @@ class ChatterboxAudiobookGenerator:
         abs_cover_path = output_path.with_suffix(".cover.jpg")
         try:
             voice_label = self.reference_id or (Path(self.reference_audio).stem if self.reference_audio else "default")
-            narrator_list = [f"Chatterbox TTS ({voice_label})"]
+            narrator_list = [f"{engine_label} ({voice_label})"]
             abs_chapters = [
                 {
                     "id": idx,
@@ -1273,7 +1484,7 @@ class ChatterboxAudiobookGenerator:
                 abs_meta = {
                     "title": book_title,
                     "subtitle": book_meta.get("subtitle"),
-                    "authors": book_meta.get("authors") or ([book_author] if book_author != "Chatterbox TTS" else []),
+                    "authors": book_meta.get("authors") or ([book_author] if book_author not in ("Qwen3-TTS", "Chatterbox TTS") else []),
                     "narrators": narrator_list,
                     "series": book_meta.get("series") or [],
                     "genres": book_meta.get("genres") or [],
@@ -1286,7 +1497,7 @@ class ChatterboxAudiobookGenerator:
                     "language": "en",
                     "explicit": False,
                     "abridged": False,
-                    "tags": ["TTS", "MinerU", "Chatterbox"],
+                    "tags": ["TTS", "MinerU", "Qwen3-TTS" if self.tts_engine == "qwen3" else "Chatterbox"],
                     "chapters": abs_chapters,
                 }
             abs_meta_path.write_text(json.dumps(abs_meta, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -1333,8 +1544,15 @@ class ChatterboxAudiobookGenerator:
         return success
 
 
+# Aliases for clarity across Qwen3-TTS and Chatterbox callers
+Qwen3AudiobookGenerator = ChatterboxAudiobookGenerator
+TTSAudiobookGenerator = ChatterboxAudiobookGenerator
+
+
 def parse_args():
-    parser = argparse.ArgumentParser(description="Convert documents to audiobooks & synchronized EPUB3 via Chatterbox TTS.")
+    parser = argparse.ArgumentParser(
+        description="Convert documents to audiobooks & synchronized EPUB3 via Qwen3-TTS (default) or Chatterbox TTS."
+    )
     parser.add_argument("input_path", nargs="?", type=Path, default=None, help="Text/Markdown file or folder of page files.")
     parser.add_argument("-o", "--output", type=Path, default=None, help="Output audiobook file (.m4b, .mp3, etc.).")
     parser.add_argument("-e", "--epub-output", type=Path, default=None, help="Output synchronized EPUB3 file (.epub).")
@@ -1344,10 +1562,28 @@ def parse_args():
     parser.add_argument("--author", type=str, default=None, help="Book author metadata.")
     parser.add_argument("--skip-epub", "--no-epub", action="store_true", help="Skip generating synchronized EPUB3.")
     parser.add_argument("--format", type=str, default=None, choices=ChatterboxAudiobookGenerator._SUPPORTED_AUDIO_FORMATS)
-    parser.add_argument("--model", type=str, default=None, choices=["standard", "turbo"], help="Chatterbox model variant.")
+    parser.add_argument(
+        "--tts-engine",
+        "--engine",
+        dest="tts_engine",
+        type=str,
+        default=None,
+        choices=["qwen3", "chatterbox", "qwen", "qwen3-tts", "cb"],
+        help="TTS engine to use: 'qwen3' (default) or 'chatterbox' (or set TTS_ENGINE env var).",
+    )
+    parser.add_argument("--qwen3", "--qwen", dest="tts_engine", action="store_const", const="qwen3", help="Use Qwen3-TTS engine.")
+    parser.add_argument("--chatterbox", dest="tts_engine", action="store_const", const="chatterbox", help="Use Chatterbox TTS engine.")
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help="Model variant: 'standard'/'1.7b' (Qwen3 1.7B or Chatterbox 500M), 'turbo'/'0.6b' (Qwen3 0.6B or Chatterbox Turbo 350M), or HF repo/path.",
+    )
     parser.add_argument("--devices", type=str, default=None, help="Comma-separated device list (e.g. 'cuda:0,cuda:1').")
-    parser.add_argument("--reference-id", type=str, default=None, help="Preset reference voice ID.")
-    parser.add_argument("--reference-audio", type=str, default=None, help="Path to reference audio for voice cloning.")
+    parser.add_argument("--workers-per-gpu", type=int, default=None, help="Number of worker processes per GPU (default: 3).")
+    parser.add_argument("--reference-id", type=str, default=None, help="Preset reference voice ID (default: practical_engineering).")
+    parser.add_argument("--reference-audio", type=str, default=None, help="Path to reference audio WAV for voice cloning.")
+    parser.add_argument("--reference-text", type=str, default=None, help="Reference transcript string or .lab/.txt file for voice cloning.")
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--top-p", type=float, default=None)
     parser.add_argument("--repetition-penalty", type=float, default=None)
@@ -1365,12 +1601,15 @@ def main():
 
     if args.list_references:
         ref_dir = Path(config.REFERENCES_FOLDER)
+        if not ref_dir.exists():
+            ref_dir = SCRIPT_DIR / config.REFERENCES_FOLDER
         print(f"Available reference voices in {ref_dir}:")
         if ref_dir.exists():
             for d in sorted(ref_dir.iterdir()):
                 if d.is_dir():
                     wavs = list(d.glob("*.wav"))
-                    print(f"  • {d.name} ({len(wavs)} audio file(s))")
+                    labs = list(d.glob("*.lab")) + list(d.glob("*.txt"))
+                    print(f"  • {d.name} ({len(wavs)} audio file(s), {len(labs)} transcript file(s))")
         sys.exit(0)
 
     if not args.input_path:
@@ -1392,6 +1631,7 @@ def main():
     generator = ChatterboxAudiobookGenerator(
         reference_id=args.reference_id,
         reference_audio=args.reference_audio,
+        reference_text=args.reference_text,
         model_type=args.model,
         devices=devices,
         temperature=args.temperature,
@@ -1400,6 +1640,8 @@ def main():
         cfg_weight=args.cfg_weight,
         exaggeration=args.exaggeration,
         no_cache=args.no_cache,
+        tts_engine=args.tts_engine,
+        workers_per_gpu=args.workers_per_gpu,
     )
 
     try:

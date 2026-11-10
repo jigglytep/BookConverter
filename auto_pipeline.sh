@@ -5,7 +5,7 @@
 # Orchestrates 3 conversion stages sequentially, processing one PDF at a time:
 #   1. MinerU OCR (mineru/batch_fast.sh)
 #   2. TTS Markdown Stripper (TTS_Script/batch_fast.sh)
-#   3. Chatterbox TTS & AudioBookshelf Upload (chatterbox/batch_fast.sh)
+#   3. Qwen3-TTS / Chatterbox TTS & AudioBookshelf Upload (chatterbox/batch_fast.sh)
 #
 # Designed for standalone execution and recurring CRON automation.
 # Uses a strict PID lockfile to prevent overlapping runs and GPU contention.
@@ -14,6 +14,18 @@ set -uo pipefail
 
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$BASE_DIR"
+
+_CALLER_TTS_ENGINE="${TTS_ENGINE:-}"
+_CALLER_QWEN_TTS_ENV="${QWEN_TTS_ENV:-}"
+_CALLER_HF_HOME="${HF_HOME:-}"
+
+set -a
+[[ -f "$BASE_DIR/.env" ]] && source "$BASE_DIR/.env"
+set +a
+
+export TTS_ENGINE="${_CALLER_TTS_ENGINE:-${TTS_ENGINE:-qwen3}}"
+export QWEN_TTS_ENV="${_CALLER_QWEN_TTS_ENV:-${QWEN_TTS_ENV:-/mnt/raid0/qwen/src/tts-env}}"
+export HF_HOME="${_CALLER_HF_HOME:-${HF_HOME:-/mnt/raid0/qwen/huggingface}}"
 
 IN_DIR="${BASE_DIR}/in"
 COMPLETED_DIR="${BASE_DIR}/completed"
@@ -104,9 +116,13 @@ Options:
   --skip-epub            Skip EPUB generation step
   --skip-pdf             Skip uploading companion PDF to AudioBookshelf
   --library <name>       Target AudioBookshelf library name (default: TTS)
-  --model <model>        Chatterbox TTS model: standard, turbo (default: standard)
-  --reference-id <id>    Chatterbox preset reference voice ID (e.g. practical_engineering)
+  --tts-engine <engine>  TTS engine: qwen3 (default) or chatterbox (or env TTS_ENGINE)
+  --qwen3                Use Qwen3-TTS engine (default)
+  --chatterbox           Use Chatterbox TTS fallback engine
+  --model <model>        TTS model: standard, turbo (default: standard)
+  --reference-id <id>    Preset reference voice ID (default: practical_engineering)
   --reference-audio <f>  Path to reference audio WAV for voice cloning
+  --reference-text <txt> Transcript text or .lab/.txt path for reference audio
   --workers <N>          Worker count forwarded to mineru/batch_fast.sh
   --plain                Non-TTY / unattended mode: line-per-event + periodic progress heartbeat
   --quiet, -q            Suppress routine INFO/DEBUG lines in status display
@@ -172,6 +188,26 @@ while [[ $# -gt 0 ]]; do
       chatterbox_forward_args+=("$1")
       shift
       ;;
+    --tts-engine|--engine)
+      export TTS_ENGINE="$2"
+      chatterbox_forward_args+=("--tts-engine" "$2")
+      shift 2
+      ;;
+    --tts-engine=*|--engine=*)
+      export TTS_ENGINE="${1#*=}"
+      chatterbox_forward_args+=("--tts-engine=${TTS_ENGINE}")
+      shift
+      ;;
+    --qwen3)
+      export TTS_ENGINE="qwen3"
+      chatterbox_forward_args+=("--qwen3")
+      shift
+      ;;
+    --chatterbox)
+      export TTS_ENGINE="chatterbox"
+      chatterbox_forward_args+=("--chatterbox")
+      shift
+      ;;
     --model)
       chatterbox_forward_args+=("--model" "$2")
       shift 2
@@ -193,6 +229,22 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --reference-audio=*)
+      chatterbox_forward_args+=("$1")
+      shift
+      ;;
+    --reference-text)
+      chatterbox_forward_args+=("--reference-text" "$2")
+      shift 2
+      ;;
+    --reference-text=*)
+      chatterbox_forward_args+=("$1")
+      shift
+      ;;
+    --workers-per-gpu)
+      chatterbox_forward_args+=("--workers-per-gpu" "$2")
+      shift 2
+      ;;
+    --workers-per-gpu=*)
       chatterbox_forward_args+=("$1")
       shift
       ;;
@@ -721,6 +773,7 @@ process_single_pdf() {
 echo "================================================================================"
 echo -e "${C_BOLD}Automated PDF to Audiobook Conversion Pipeline${C_RESET}"
 echo "================================================================================"
+log INFO "TTS Engine:          ${TTS_ENGINE}"
 log INFO "Input Directory:     ${IN_DIR}"
 log INFO "Completed Directory: ${COMPLETED_DIR}"
 log INFO "Failed Directory:    ${FAILED_DIR}"

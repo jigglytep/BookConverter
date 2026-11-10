@@ -72,3 +72,4 @@ checkpoints/
 **/*.wav
 chatterbox/chatterbox_repo
 chatterbox/chatterbox_repo
+chatterbox/audiobooks/batch_failures.txt

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Batch Audiobook & EPUB Pipeline using Chatterbox TTS, mineru_to_epub, and ABS
+# Batch Audiobook & EPUB Pipeline using Qwen3-TTS (or Chatterbox TTS), mineru_to_epub, and ABS
 #
 # Processes text page folders in ../TTS_Script/out/
-# 1. Synthesizes audiobooks (.m4b) via audiobook_tts.py
+# 1. Synthesizes audiobooks (.m4b) via audiobook_tts.py (Qwen3-TTS default; Chatterbox toggleable)
 # 2. Moves completed source folder to completed/
 # 3. Generates companion EPUB3 ebook (.epub) via mineru_to_epub.py
 # 4. Uploads .m4b and .epub together to AudioBookshelf via upload_to_abs.py
@@ -13,31 +13,54 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# Activate Python virtual environment
-VENV_ACTIVATE="${VENV_PATH:-$SCRIPT_DIR/../.venv/bin/activate}"
-if [[ -f "$VENV_ACTIVATE" ]]; then
-  # shellcheck source=/dev/null
-  source "$VENV_ACTIVATE"
-elif [[ -f "$SCRIPT_DIR/.venv/bin/activate" ]]; then
-  # shellcheck source=/dev/null
-  source "$SCRIPT_DIR/.venv/bin/activate"
-elif [[ -f "$SCRIPT_DIR/../.venv/bin/activate" ]]; then
-  # shellcheck source=/dev/null
-  source "$SCRIPT_DIR/../.venv/bin/activate"
-fi
-
-if [[ -x "$SCRIPT_DIR/.venv/bin/python3" ]]; then
-  PYTHON_BIN="$SCRIPT_DIR/.venv/bin/python3"
-elif [[ -x "$SCRIPT_DIR/../.venv/bin/python3" ]]; then
-  PYTHON_BIN="$SCRIPT_DIR/../.venv/bin/python3"
-else
-  PYTHON_BIN="$(command -v python3)"
-fi
+_CALLER_TTS_ENGINE="${TTS_ENGINE:-}"
+_CALLER_QWEN_TTS_ENV="${QWEN_TTS_ENV:-}"
+_CALLER_HF_HOME="${HF_HOME:-}"
 
 set -a
 [[ -f "$SCRIPT_DIR/../.env" ]] && source "$SCRIPT_DIR/../.env"
 [[ -f "$SCRIPT_DIR/.env" ]] && source "$SCRIPT_DIR/.env"
 set +a
+
+export TTS_ENGINE="${_CALLER_TTS_ENGINE:-${TTS_ENGINE:-qwen3}}"
+export QWEN_TTS_ENV="${_CALLER_QWEN_TTS_ENV:-${QWEN_TTS_ENV:-/mnt/raid0/qwen/src/tts-env}}"
+export HF_HOME="${_CALLER_HF_HOME:-${HF_HOME:-/mnt/raid0/qwen/huggingface}}"
+
+select_python_bin() {
+  local eng="${1:-$TTS_ENGINE}"
+  eng="${eng,,}"
+  if [[ "$eng" == "chatterbox"* ]] && [[ -x "$SCRIPT_DIR/.venv/bin/python3" ]]; then
+    PYTHON_BIN="$SCRIPT_DIR/.venv/bin/python3"
+  elif [[ -x "$QWEN_TTS_ENV/bin/python3" ]]; then
+    PYTHON_BIN="$QWEN_TTS_ENV/bin/python3"
+  elif [[ -x "$SCRIPT_DIR/.venv/bin/python3" ]]; then
+    PYTHON_BIN="$SCRIPT_DIR/.venv/bin/python3"
+  elif [[ -x "$SCRIPT_DIR/../.venv/bin/python3" ]]; then
+    PYTHON_BIN="$SCRIPT_DIR/../.venv/bin/python3"
+  else
+    PYTHON_BIN="$(command -v python3)"
+  fi
+}
+
+# Activate Python virtual environment
+if [[ "${TTS_ENGINE,,}" != "chatterbox"* ]] && [[ -f "$QWEN_TTS_ENV/bin/activate" ]]; then
+  # shellcheck source=/dev/null
+  source "$QWEN_TTS_ENV/bin/activate"
+else
+  VENV_ACTIVATE="${VENV_PATH:-$SCRIPT_DIR/../.venv/bin/activate}"
+  if [[ -f "$VENV_ACTIVATE" ]]; then
+    # shellcheck source=/dev/null
+    source "$VENV_ACTIVATE"
+  elif [[ -f "$SCRIPT_DIR/.venv/bin/activate" ]]; then
+    # shellcheck source=/dev/null
+    source "$SCRIPT_DIR/.venv/bin/activate"
+  elif [[ -f "$SCRIPT_DIR/../.venv/bin/activate" ]]; then
+    # shellcheck source=/dev/null
+    source "$SCRIPT_DIR/../.venv/bin/activate"
+  fi
+fi
+
+select_python_bin "$TTS_ENGINE"
 
 show_help() {
   echo "Usage: $0 [options] [target_dir ...]"
@@ -71,11 +94,15 @@ show_help() {
   echo "  --author <name>         Book author"
   echo "  --series <name>         Book series"
   echo
-  echo "Chatterbox TTS Options (forwarded directly to audiobook_tts.py):"
+  echo "TTS Options (forwarded directly to audiobook_tts.py):"
+  echo "  --tts-engine <engine>   TTS engine: qwen3 (default) or chatterbox (or env TTS_ENGINE)"
+  echo "  --qwen3                 Use Qwen3-TTS engine (default)"
+  echo "  --chatterbox            Use Chatterbox TTS fallback engine"
   echo "  --model {standard,turbo}"
   echo "  --devices <devices>     Comma-separated device list (e.g. 'cuda:0,cuda:1')"
-  echo "  --reference-id <id>     Preset reference voice ID"
+  echo "  --reference-id <id>     Preset reference voice ID (default: practical_engineering)"
   echo "  --reference-audio <path>Path to reference audio for voice cloning"
+  echo "  --reference-text <txt>  Transcript text or .lab/.txt path for reference audio"
   echo "  --temperature <val>     Sampling temperature"
   echo "  --clean-chunks          Delete intermediate chunk WAV files after assembly"
   echo "  --no-cache              Bypass chunk audio cache"
@@ -262,6 +289,30 @@ while [[ $# -gt 0 ]]; do
       BOOK_SERIES="${1#*=}"
       shift
       ;;
+    --tts-engine|--engine)
+      export TTS_ENGINE="$2"
+      select_python_bin "$TTS_ENGINE"
+      tts_args+=("--tts-engine" "$2")
+      shift 2
+      ;;
+    --tts-engine=*|--engine=*)
+      export TTS_ENGINE="${1#*=}"
+      select_python_bin "$TTS_ENGINE"
+      tts_args+=("--tts-engine=${TTS_ENGINE}")
+      shift
+      ;;
+    --qwen3)
+      export TTS_ENGINE="qwen3"
+      select_python_bin "$TTS_ENGINE"
+      tts_args+=("--qwen3")
+      shift
+      ;;
+    --chatterbox)
+      export TTS_ENGINE="chatterbox"
+      select_python_bin "$TTS_ENGINE"
+      tts_args+=("--chatterbox")
+      shift
+      ;;
     --model)
       tts_args+=("--model" "$2")
       shift 2
@@ -278,6 +329,14 @@ while [[ $# -gt 0 ]]; do
       tts_args+=("$1")
       shift
       ;;
+    --workers-per-gpu)
+      tts_args+=("--workers-per-gpu" "$2")
+      shift 2
+      ;;
+    --workers-per-gpu=*)
+      tts_args+=("$1")
+      shift
+      ;;
     --reference-id)
       tts_args+=("--reference-id" "$2")
       shift 2
@@ -291,6 +350,14 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --reference-audio=*)
+      tts_args+=("$1")
+      shift
+      ;;
+    --reference-text)
+      tts_args+=("--reference-text" "$2")
+      shift 2
+      ;;
+    --reference-text=*)
       tts_args+=("$1")
       shift
       ;;
@@ -349,10 +416,18 @@ if [[ ${#target_dirs[@]} -eq 0 ]]; then
   exit 0
 fi
 
+if [[ "${TTS_ENGINE,,}" == "chatterbox"* ]]; then
+  TTS_ENGINE_LABEL="Chatterbox TTS"
+else
+  TTS_ENGINE_LABEL="Qwen3-TTS"
+fi
+
 echo "================================================================================"
-echo " Chatterbox TTS & EPUB Batch Pipeline"
+echo " ${TTS_ENGINE_LABEL} & EPUB Batch Pipeline"
 echo "================================================================================"
 echo "Found ${#target_dirs[@]} folder(s) to process."
+echo "TTS Engine:          ${TTS_ENGINE_LABEL} (TTS_ENGINE=${TTS_ENGINE})"
+echo "Python Runtime:      ${PYTHON_BIN}"
 echo "Input directory:     ${IN_DIR}"
 echo "Output directory:    ${OUT_DIR}"
 echo "Completed directory: ${COMPLETED_DIR}"
@@ -445,9 +520,9 @@ for target_dir in "${target_dirs[@]}"; do
   # ----------------------------------------------------------------------------
   # Step 1: Synthesize Audiobook & Synchronized EPUB3 via audiobook_tts.py
   # ----------------------------------------------------------------------------
-  echo "--- [1/3] Synthesizing Audiobook & Synchronized EPUB3 with Chatterbox TTS ---"
+  echo "--- [1/3] Synthesizing Audiobook & Synchronized EPUB3 with ${TTS_ENGINE_LABEL} ---"
   epub_pre_source=$(find_epub_source "$book_name" "$target_dir")
-  step1_args=("$target_dir" -o "$audio_out" --format "$AUDIO_FORMAT")
+  step1_args=("$target_dir" -o "$audio_out" --format "$AUDIO_FORMAT" --tts-engine "$TTS_ENGINE")
   if [[ -n "$BOOK_TITLE" ]]; then
     step1_args+=(--title "$BOOK_TITLE")
   fi

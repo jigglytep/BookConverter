@@ -72,11 +72,17 @@ class StageSpec:
     weight_sec_per_page: float  # Prior heuristic for book ETA before stage runs
 
 
+_ACTIVE_TTS_LABEL = (
+    "Chatterbox"
+    if os.environ.get("TTS_ENGINE", "qwen3").strip().lower().startswith("chatterbox")
+    else "Qwen3-TTS"
+)
+
 PIPELINE_STAGES: Tuple[StageSpec, ...] = (
     StageSpec("mineru", "1. PDF Extract (MinerU)", "pages", 1.8),
     StageSpec("md_tts", "2. Text Clean & Math (md_tts)", "pages", 0.15),
     StageSpec("dom_prep", "3a. DOM & Chunk Prep", "pages", 0.08),
-    StageSpec("tts_synth", "3b. TTS Synthesis (Chatterbox)", "chunks", 8.5),
+    StageSpec("tts_synth", f"3b. TTS Synthesis ({_ACTIVE_TTS_LABEL})", "chunks", 8.5),
     StageSpec("smil_assembly", "3c. Audio & SMIL Assembly", "pages", 0.25),
     StageSpec("epub_m4b_mux", "3d. EPUB3 & M4B Encode/Mux", "steps", 0.05),
     StageSpec("abs_upload", "3e. AudioBookshelf Upload", "steps", 0.03),
@@ -108,9 +114,14 @@ STAGE_ALIASES: Dict[str, str] = {
     "3b": "tts_synth",
     "tts": "tts_synth",
     "tts_synth": "tts_synth",
+    "qwen3": "tts_synth",
+    "qwen3-tts": "tts_synth",
+    "qwen_tts": "tts_synth",
     "chatterbox": "tts_synth",
     "tts synthesis": "tts_synth",
+    "tts synthesis (qwen3-tts)": "tts_synth",
     "tts synthesis (chatterbox)": "tts_synth",
+    "3b. tts synthesis (qwen3-tts)": "tts_synth",
     "3b. tts synthesis (chatterbox)": "tts_synth",
     "3c": "smil_assembly",
     "smil": "smil_assembly",
