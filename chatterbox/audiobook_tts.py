@@ -429,6 +429,28 @@ class ChatterboxAudiobookGenerator:
             pages = [(label, text, stem) for label, text, stem in pages if len(text.strip()) > 1]
             if not pages:
                 raise ValueError(f"No text extracted from files in {input_path}")
+
+            # Apply Inter-page micro-page merging (< MIN_PHRASE_WORDS)
+            min_words = getattr(config, "MIN_PHRASE_WORDS", 4)
+            pause_delim = getattr(config, "PAUSE_DELIMITER", " - ")
+            if len(pages) > 1:
+                merged_pages = []
+                for i in range(len(pages)):
+                    label, text, stem = pages[i]
+                    w_count = len(text.split())
+                    if w_count < min_words:
+                        if i + 1 < len(pages):
+                            n_lbl, n_txt, n_stem = pages[i + 1]
+                            pages[i + 1] = (n_lbl, f"{text.strip()}{pause_delim}{n_txt.lstrip()}", n_stem)
+                        elif merged_pages:
+                            p_lbl, p_txt, p_stem = merged_pages[-1]
+                            merged_pages[-1] = (p_lbl, f"{p_txt.rstrip()}{pause_delim}{text.strip()}", p_stem)
+                        else:
+                            merged_pages.append((label, text, stem))
+                    else:
+                        merged_pages.append((label, text, stem))
+                pages = merged_pages
+
             return pages
 
         raise FileNotFoundError(input_path)
@@ -438,74 +460,87 @@ class ChatterboxAudiobookGenerator:
     # ------------------------------------------------------------------ #
 
     def split_into_chunks(self, text: str) -> List[str]:
-        """Split text into sentence-first chunks respecting word count limits (ADHD-optimized)."""
+        """
+        Split text into an array of optimal-sized phrases (target CHUNK_SIZE_WORDS) using a sliding window.
+        Merges micro-phrases (< MIN_PHRASE_WORDS) with adjacent sentences inserting
+        PAUSE_DELIMITER (' - ') to preserve cadence without triggering TTS artifacts.
+        """
         if not text.strip():
             return []
 
-        # Split on sentence terminals
-        sentences = re.split(r"(?<=[.!?])\s+", text)
-        chunks = []
-        current_chunk = ""
-        current_words = 0
-        limit = config.CHUNK_SIZE_WORDS
-        min_standalone_words = 6
+        min_words = getattr(config, "MIN_PHRASE_WORDS", 4)
+        target_words = getattr(config, "CHUNK_SIZE_WORDS", 24)
+        max_words = getattr(config, "MAX_CHUNK_WORDS", 32)
+        pause_delim = getattr(config, "PAUSE_DELIMITER", " - ")
 
-        for sentence in sentences:
-            sentence = sentence.strip()
-            if not sentence:
-                continue
-            sentence_words = len(sentence.split())
+        # 1. Break text into atomic phrases/sentences
+        raw_sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+        atomic_phrases: List[str] = []
 
-            if sentence_words > limit:
-                if current_chunk:
-                    chunks.append(current_chunk.strip())
-                    current_chunk = ""
-                    current_words = 0
-                parts = [p.strip() for p in re.split(r"(?<=[,;:\u2014\u2013])\s+|\n+", sentence) if p.strip()]
-                for part in parts:
-                    part_words = len(part.split())
-                    if part_words > limit:
-                        if current_chunk:
-                            chunks.append(current_chunk.strip())
-                            current_chunk = ""
-                            current_words = 0
-                        words = part.split()
-                        for i in range(0, len(words), limit):
-                            chunks.append(" ".join(words[i : i + limit]))
-                    elif current_words + part_words <= limit:
-                        current_chunk += part + " "
-                        current_words += part_words
+        for sent in raw_sentences:
+            w_count = len(sent.split())
+            if w_count > max_words:
+                # Split on major clause boundaries
+                clauses = [p.strip() for p in re.split(r"(?<=[,;:\u2014\u2013])\s+|\n+", sent) if p.strip()]
+                for cl in clauses:
+                    cw = len(cl.split())
+                    if cw > max_words:
+                        sp = cl.split()
+                        for i in range(0, len(sp), target_words):
+                            atomic_phrases.append(" ".join(sp[i : i + target_words]))
                     else:
-                        if current_chunk:
-                            chunks.append(current_chunk.strip())
-                        current_chunk = part + " "
-                        current_words = part_words
-                if current_chunk and current_words >= min_standalone_words:
-                    chunks.append(current_chunk.strip())
-                    current_chunk = ""
-                    current_words = 0
+                        atomic_phrases.append(cl)
             else:
-                # Only merge with previous chunk if previous chunk is a tiny fragment (< 6 words)
-                # or this sentence is a tiny fragment (< 6 words) and fits within limit.
-                if current_chunk and (current_words < min_standalone_words or sentence_words < min_standalone_words) and (current_words + sentence_words <= limit):
-                    current_chunk += sentence + " "
-                    current_words += sentence_words
-                else:
-                    if current_chunk:
-                        chunks.append(current_chunk.strip())
-                    current_chunk = sentence + " "
-                    current_words = sentence_words
+                atomic_phrases.append(sent)
 
-                if current_words >= min_standalone_words:
-                    chunks.append(current_chunk.strip())
-                    current_chunk = ""
-                    current_words = 0
+        # 2. Sliding window accumulator
+        chunks: List[str] = []
+        curr_chunk = ""
+        curr_words = 0
 
-        if current_chunk.strip():
-            if chunks and current_words < min_standalone_words and (len(chunks[-1].split()) + current_words <= limit + 4):
-                chunks[-1] = f"{chunks[-1]} {current_chunk.strip()}"
+        for phrase in atomic_phrases:
+            phrase_words = len(phrase.split())
+            if not phrase_words:
+                continue
+
+            if not curr_chunk:
+                curr_chunk = phrase
+                curr_words = phrase_words
+                continue
+
+            # Check if adding exceeds max_words
+            if curr_words + phrase_words > max_words:
+                if curr_words >= min_words:
+                    chunks.append(curr_chunk.strip())
+                    curr_chunk = phrase
+                    curr_words = phrase_words
+                    continue
+                # If current buffer was micro-sized, force merge with cadence pause
+                curr_chunk = f"{curr_chunk.strip()}{pause_delim}{phrase.strip()}"
+                curr_words += phrase_words
+                chunks.append(curr_chunk.strip())
+                curr_chunk = ""
+                curr_words = 0
+                continue
+
+            # Determine join separator: insert pause delimiter if merging a micro-phrase
+            is_micro = curr_words < min_words or phrase_words < min_words
+            sep = pause_delim if is_micro else " "
+            curr_chunk = f"{curr_chunk.strip()}{sep}{phrase.strip()}"
+            curr_words += phrase_words
+
+            # If reached optimal target and ends on sentence boundary, flush
+            if curr_words >= target_words and curr_chunk[-1:] in ".!?":
+                chunks.append(curr_chunk.strip())
+                curr_chunk = ""
+                curr_words = 0
+
+        if curr_chunk.strip():
+            # If trailing fragment is micro-sized, merge into last chunk
+            if chunks and curr_words < min_words:
+                chunks[-1] = f"{chunks[-1].strip()}{pause_delim}{curr_chunk.strip()}"
             else:
-                chunks.append(current_chunk.strip())
+                chunks.append(curr_chunk.strip())
 
         return [c for c in chunks if c.strip()]
 
@@ -1007,11 +1042,54 @@ class ChatterboxAudiobookGenerator:
             md_opts = _default_md_tts_opts()
             md_stats = {"equations": 0, "converted": 0, "errors": 0}
 
+            # Pre-scan pages for Inter-Page micro-page merging (< 4 words)
+            min_phrase_words = getattr(config, "MIN_PHRASE_WORDS", 4)
+            pause_delim = getattr(config, "PAUSE_DELIMITER", " - ")
+
+            page_data_list = []
             for idx, doc_file in enumerate(doc_files, 1):
                 pnum = extract_page_number(doc_file, idx)
                 chap_title = format_page_chapter_title(pnum, toc_map)
                 raw_text = read_file_text(doc_file)
                 is_plain = doc_file.suffix.lower() in (".txt", ".text")
+                clean_text = re.sub(r"<[^>]+>", " ", raw_text)
+                clean_text = re.sub(r"[#*_`~\[\]\(\)\{\}\|=+\\\/]", " ", clean_text)
+                word_count = len([w for w in clean_text.split() if any(c.isalnum() for c in w)])
+                page_data_list.append({
+                    "idx": idx,
+                    "doc_file": doc_file,
+                    "pnum": pnum,
+                    "chap_title": chap_title,
+                    "raw_text": raw_text,
+                    "is_plain": is_plain,
+                    "word_count": word_count,
+                    "merged_forward": False,
+                    "merged_backward": False,
+                })
+
+            n_pages = len(page_data_list)
+            for i in range(n_pages):
+                item = page_data_list[i]
+                if 0 < item["word_count"] < min_phrase_words:
+                    if i + 1 < n_pages:
+                        clean_lead = item["raw_text"].strip()
+                        page_data_list[i + 1]["raw_text"] = f"{clean_lead}{pause_delim}{page_data_list[i + 1]['raw_text'].lstrip()}"
+                        item["merged_forward"] = True
+                        console.print(f"[cyan]Micro-page {item['pnum']} ({item['word_count']} words) prepended to page {page_data_list[i+1]['pnum']} with '{pause_delim.strip()}' pause[/cyan]")
+                    elif i > 0:
+                        clean_tail = item["raw_text"].strip()
+                        page_data_list[i - 1]["raw_text"] = f"{page_data_list[i - 1]['raw_text'].rstrip()}{pause_delim}{clean_tail}"
+                        item["merged_backward"] = True
+                        console.print(f"[cyan]Micro-page {item['pnum']} ({item['word_count']} words) appended to page {page_data_list[i-1]['pnum']} with '{pause_delim.strip()}' pause[/cyan]")
+
+            for item in page_data_list:
+                doc_file = item["doc_file"]
+                pnum = item["pnum"]
+                chap_title = item["chap_title"]
+                raw_text = item["raw_text"]
+                is_plain = item["is_plain"]
+                is_absorbed = item["merged_forward"] or item["merged_backward"]
+
                 pdom = prepare_page_dom_and_chunks(
                     page_num=pnum,
                     chapter_title=chap_title,
@@ -1023,7 +1101,11 @@ class ChatterboxAudiobookGenerator:
                     chunk_size_words=config.CHUNK_SIZE_WORDS,
                     md_opts=md_opts,
                     md_stats=md_stats,
+                    allow_empty_chunks=is_absorbed,
                 )
+                if is_absorbed:
+                    pdom.chunks.clear()
+
                 page_doms.append(pdom)
                 page_stems.append(doc_file.stem)
                 if _sdisp is not None:

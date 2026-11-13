@@ -95,8 +95,10 @@ Automates the complete PDF-to-audiobook conversion pipeline:
 
 Options:
   -n, --dry-run          Preview actions and pending queue without moving files or executing stages
-  -c, --clean, --cleanup Clear all existing in-progress items (mineru/in, mineru/out, TTS_Script/out,
-                         unfinished stage artifacts) and Chatterbox chunks & audio cache
+  -c, --clean, --cleanup, --clean-cache
+                         Clean up all caches and progress files not in completed folders
+                         (removes intermediate md, txt, wav files, chunks, and audio caches;
+                         preserves completed/ folders)
   --no-drain             Skip backlog draining (do not process leftover mineru/out or TTS_Script/out folders)
   --force                Force re-conversion even if final audiobook (.m4b) already exists
   --stop-on-error        Halt immediately if any book fails (default: quarantine to failed/ and continue)
@@ -118,7 +120,9 @@ Options:
 Examples:
   $0                             # Process all PDFs in in/
   $0 --dry-run                   # Check queue and status without executing
-  $0 --clean                     # Clear all in-progress items, chunks, and TTS audio cache
+  $0 --clean                     # Clear all caches and progress files (preserving completed/)
+  $0 --clean-cache               # Alias for --clean
+  $0 --clean --dry-run           # Preview caches and progress files to delete
   $0 in/MyBook.pdf               # Process single specific PDF
   $0 --model turbo --skip-upload # Process queue with turbo TTS and no ABS upload
 EOF
@@ -135,7 +139,7 @@ while [[ $# -gt 0 ]]; do
       DRY_RUN=true
       shift
       ;;
-    -c|--clean|--cleanup|--clear-cache)
+    -c|--clean|--cleanup|--clean-cache|--clear-cache|--clean-caches|--clean-progress|--clean-all)
       CLEAN_IN_PROGRESS=true
       shift
       ;;
@@ -352,96 +356,186 @@ mark_book_completed() {
   fi
 }
 
-# Clear all existing in-progress items, unfinished stage artifacts, and TTS caches
+# Clear all existing caches and progress files not in completed folders
 clean_in_progress_and_cache() {
-  log STEP "Cleaning all in-progress items, intermediate chunks, and TTS audio cache..."
+  log STEP "Cleaning all caches and progress files (preserving completed/ folders)..."
 
   shopt -s nullglob
 
-  # 1. Clean unfinished Stage 2/3 books in TTS_Script/out/ (and their Stage 1/2 artifacts if not completed)
-  local tts_items=("$TTS_DIR/out"/*)
-  for item in "${tts_items[@]}"; do
-    local name
-    name="$(basename "$item")"
-    if [[ -d "$item" ]]; then
-      local bname="${name%_txt}"
-      bname="${bname%_md}"
-      log INFO "Removing in-progress TTS text folder: ${item}"
+  # 1. Clean in-progress Markdown folders and OCR artifacts in mineru/out/ (preserving TTS_Script/completed/*_md)
+  local mineru_out_items=("$MINERU_DIR/out"/*)
+  if (( ${#mineru_out_items[@]} > 0 )); then
+    local mout_size
+    mout_size=$(du -sh "$MINERU_DIR/out" 2>/dev/null | awk '{print $1}' || echo "unknown")
+    log INFO "Found ${#mineru_out_items[@]} item(s) in ${MINERU_DIR}/out/ (size: ${mout_size}, in-progress MD folders, page folders, and OCR run logs)..."
+    for item in "${mineru_out_items[@]}"; do
+      local item_name
+      item_name="$(basename "$item")"
+      log INFO "  Removing MinerU in-progress artifact: ${item_name}"
       if [[ "$DRY_RUN" == "false" ]]; then
         rm -rf "$item"
       fi
-      # If this book has not produced a final .m4b, also remove its unfinished Stage 1/2 artifacts
-      if [[ ! -s "${CHATTERBOX_DIR}/audiobooks/${bname}.m4b" ]]; then
-        for artifact in \
-          "${TTS_DIR}/completed/${bname}_md" \
-          "${TTS_DIR}/completed/${bname}_pages" \
-          "${MINERU_DIR}/completed/${bname}.pdf" \
-          "${COMPLETED_DIR}/${bname}.pdf"; do
-          if [[ -e "$artifact" ]]; then
-            log INFO "Removing unfinished book artifact: ${artifact}"
-            if [[ "$DRY_RUN" == "false" ]]; then
-              rm -rf "$artifact"
-            fi
-          fi
-        done
-      fi
-    elif [[ -f "$item" ]]; then
-      log INFO "Removing file in TTS_Script/out/: ${item}"
+    done
+  else
+    log INFO "No items found in ${MINERU_DIR}/out/."
+  fi
+
+  # 2. Clean in-progress text folders and text files in TTS_Script/out/ (preserving chatterbox/completed/*_txt)
+  local tts_out_items=("$TTS_DIR/out"/*)
+  if (( ${#tts_out_items[@]} > 0 )); then
+    local tout_size
+    tout_size=$(du -sh "$TTS_DIR/out" 2>/dev/null | awk '{print $1}' || echo "unknown")
+    log INFO "Found ${#tts_out_items[@]} item(s) in ${TTS_DIR}/out/ (size: ${tout_size}, in-progress TXT folders and text files)..."
+    for item in "${tts_out_items[@]}"; do
+      local item_name
+      item_name="$(basename "$item")"
+      log INFO "  Removing TTS_Script in-progress artifact: ${item_name}"
       if [[ "$DRY_RUN" == "false" ]]; then
-        rm -f "$item"
+        rm -rf "$item"
       fi
-    fi
-  done
+    done
+  else
+    log INFO "No items found in ${TTS_DIR}/out/."
+  fi
 
-  # 2. Clean in-progress Stage 1 MinerU inputs and outputs (mineru/in/* and mineru/out/*)
-  local mineru_in_items=("$MINERU_DIR/in"/*)
-  for item in "${mineru_in_items[@]}"; do
-    log INFO "Removing staged MinerU input: ${item}"
-    if [[ "$DRY_RUN" == "false" ]]; then
-      rm -rf "$item"
-    fi
-  done
-
-  local mineru_out_items=("$MINERU_DIR/out"/*)
-  for item in "${mineru_out_items[@]}"; do
-    log INFO "Removing MinerU output/log item: ${item}"
-    if [[ "$DRY_RUN" == "false" ]]; then
-      rm -rf "$item"
-    fi
-  done
-
-  # 3. Clean Chatterbox intermediate chunk directories (chatterbox/chunks/*)
+  # 3. Clean intermediate audio chunks (chatterbox/chunks/* and kokoro/chunks/*) containing WAV files
   local chunk_dirs=("$CHATTERBOX_DIR/chunks"/*)
   if (( ${#chunk_dirs[@]} > 0 )); then
-    log INFO "Removing ${#chunk_dirs[@]} intermediate chunk folder(s) in ${CHATTERBOX_DIR}/chunks/..."
+    local chunks_size
+    chunks_size=$(du -sh "${CHATTERBOX_DIR}/chunks" 2>/dev/null | awk '{print $1}' || echo "unknown")
+    log INFO "Found ${#chunk_dirs[@]} chunk folder(s) in ${CHATTERBOX_DIR}/chunks/ (size: ${chunks_size}, intermediate WAV chunks)..."
+    for item in "${chunk_dirs[@]}"; do
+      local item_name
+      item_name="$(basename "$item")"
+      log INFO "  Removing Chatterbox intermediate chunk item: ${item_name}"
+      if [[ "$DRY_RUN" == "false" ]]; then
+        rm -rf "$item"
+      fi
+    done
+  else
+    log INFO "No intermediate chunk items found in ${CHATTERBOX_DIR}/chunks/."
+  fi
+
+  local kokoro_chunks=("${BASE_DIR}/kokoro/chunks"/*)
+  if (( ${#kokoro_chunks[@]} > 0 )); then
+    local kchunks_size
+    kchunks_size=$(du -sh "${BASE_DIR}/kokoro/chunks" 2>/dev/null | awk '{print $1}' || echo "unknown")
+    log INFO "Found ${#kokoro_chunks[@]} chunk folder(s) in ${BASE_DIR}/kokoro/chunks/ (size: ${kchunks_size})..."
+    for item in "${kokoro_chunks[@]}"; do
+      local item_name
+      item_name="$(basename "$item")"
+      log INFO "  Removing Kokoro intermediate chunk item: ${item_name}"
+      if [[ "$DRY_RUN" == "false" ]]; then
+        rm -rf "$item"
+      fi
+    done
+  fi
+
+  # 4. Clean Chatterbox TTS audio chunk caches (chatterbox/cache/audio_chunks and chatterbox/caches/audio_chunks)
+  local cb_cache_dir="${CHATTERBOX_DIR}/cache/audio_chunks"
+  if [[ -d "$cb_cache_dir" ]]; then
+    local cache_size
+    cache_size=$(du -sh "$cb_cache_dir" 2>/dev/null | awk '{print $1}' || echo "unknown")
+    log INFO "Clearing Chatterbox audio chunk cache (${cb_cache_dir}, size: ${cache_size})..."
     if [[ "$DRY_RUN" == "false" ]]; then
-      rm -rf "${CHATTERBOX_DIR}/chunks"/*
+      rm -rf "$cb_cache_dir"
+      mkdir -p "$cb_cache_dir"
     fi
   fi
 
-  # 4. Clean Chatterbox TTS audio chunk cache (chatterbox/cache/audio_chunks/*)
-  if [[ -d "${CHATTERBOX_DIR}/cache/audio_chunks" ]]; then
-    local cache_count
-    cache_count=$(find "${CHATTERBOX_DIR}/cache/audio_chunks" -maxdepth 1 -type f 2>/dev/null | wc -l)
-    if (( cache_count > 0 )); then
-      log INFO "Clearing ${cache_count} cached WAV chunk(s) in ${CHATTERBOX_DIR}/cache/audio_chunks/..."
+  local cb_caches_dir="${CHATTERBOX_DIR}/caches"
+  if [[ -d "$cb_caches_dir" ]]; then
+    local caches_size
+    caches_size=$(du -sh "$cb_caches_dir" 2>/dev/null | awk '{print $1}' || echo "unknown")
+    log INFO "Clearing Chatterbox secondary cache directory (${cb_caches_dir}, size: ${caches_size})..."
+    if [[ "$DRY_RUN" == "false" ]]; then
+      rm -rf "$cb_caches_dir"
+    fi
+  fi
+
+  # Kokoro cache if present
+  local kokoro_cache_dir="${BASE_DIR}/kokoro/cache"
+  if [[ -d "$kokoro_cache_dir" ]]; then
+    local kokoro_cache_items=("$kokoro_cache_dir"/*)
+    if (( ${#kokoro_cache_items[@]} > 0 )); then
+      local kcache_size
+      kcache_size=$(du -sh "$kokoro_cache_dir" 2>/dev/null | awk '{print $1}' || echo "unknown")
+      log INFO "Clearing Kokoro cache items in ${kokoro_cache_dir} (size: ${kcache_size})..."
       if [[ "$DRY_RUN" == "false" ]]; then
-        find "${CHATTERBOX_DIR}/cache/audio_chunks" -maxdepth 1 -type f -delete
+        rm -rf "$kokoro_cache_dir"/*
       fi
     fi
   fi
 
-  # 5. Clean any partial .raw.tmp files in chatterbox/audiobooks/
-  local tmp_raws=("$CHATTERBOX_DIR/audiobooks"/*.raw.tmp)
+  # Kokoro out if present
+  local kokoro_out_items=("${BASE_DIR}/kokoro/out"/*)
+  if (( ${#kokoro_out_items[@]} > 0 )); then
+    log INFO "Clearing Kokoro output items in ${BASE_DIR}/kokoro/out/..."
+    for item in "${kokoro_out_items[@]}"; do
+      [[ -e "$item" ]] || continue
+      log INFO "  Removing Kokoro output item: $(basename "$item")"
+      if [[ "$DRY_RUN" == "false" ]]; then
+        rm -rf "$item"
+      fi
+    done
+  fi
+
+  # 5. Clean partial / temporary audio files (.raw.tmp, .tmp, .raw in chatterbox/audiobooks/ and loose .wav in chatterbox/)
+  local tmp_raws=("$CHATTERBOX_DIR/audiobooks"/*.raw.tmp "$CHATTERBOX_DIR/audiobooks"/*.tmp "$CHATTERBOX_DIR/audiobooks"/*.raw)
   for item in "${tmp_raws[@]}"; do
-    log INFO "Removing partial raw audio temp file: ${item}"
+    [[ -e "$item" ]] || continue
+    log INFO "Removing partial audio temp file: $(basename "$item")"
     if [[ "$DRY_RUN" == "false" ]]; then
       rm -f "$item"
     fi
   done
 
+  # Remove loose test WAV files in chatterbox/ (preserves chatterbox/references/ which holds voice clones)
+  local loose_wavs=("$CHATTERBOX_DIR"/*.wav)
+  for item in "${loose_wavs[@]}"; do
+    [[ -f "$item" ]] || continue
+    log INFO "Removing loose audio file: $(basename "$item")"
+    if [[ "$DRY_RUN" == "false" ]]; then
+      rm -f "$item"
+    fi
+  done
+
+  # 6. Reconcile mineru/in/ (staged inputs)
+  local mineru_in_items=("$MINERU_DIR/in"/*)
+  for item in "${mineru_in_items[@]}"; do
+    [[ -e "$item" ]] || continue
+    local item_name
+    item_name="$(basename "$item")"
+    # Remove 0-byte corrupt files
+    if [[ ! -s "$item" ]]; then
+      log INFO "Removing 0-byte corrupt file in mineru/in/: ${item_name}"
+      if [[ "$DRY_RUN" == "false" ]]; then
+        rm -f "$item"
+      fi
+      continue
+    fi
+    # If already converted or in completed/, remove leftover staged copy
+    local bname="${item_name%.*}"
+    if is_book_completed "$bname" || [[ -f "${MINERU_DIR}/completed/${item_name}" ]] || [[ -f "${COMPLETED_DIR}/${item_name}" ]]; then
+      log INFO "Removing already completed staged input in mineru/in/: ${item_name}"
+      if [[ "$DRY_RUN" == "false" ]]; then
+        rm -f "$item"
+      fi
+    elif [[ -f "${IN_DIR}/${item_name}" ]]; then
+      log INFO "Removing duplicate staged input in mineru/in/ (already exists in in/): ${item_name}"
+      if [[ "$DRY_RUN" == "false" ]]; then
+        rm -f "$item"
+      fi
+    else
+      log INFO "Returning staged input to in/: ${item_name}"
+      if [[ "$DRY_RUN" == "false" ]]; then
+        mv "$item" "${IN_DIR}/${item_name}"
+      fi
+    fi
+  done
+
   shopt -u nullglob
-  log SUCCESS "Cleanup of in-progress items and caches complete."
+  log SUCCESS "Cleanup of caches and progress files complete. All completed folders preserved."
 }
 
 # Drain existing backlog in TTS_Script/out and mineru/out

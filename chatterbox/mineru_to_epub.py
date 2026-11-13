@@ -50,6 +50,11 @@ import latex2mathml.converter
 import markdown
 import numpy as np
 
+try:
+    import config
+except ImportError:
+    config = None
+
 # Setup logging
 logger = logging.getLogger("mineru_to_epub")
 
@@ -1201,12 +1206,23 @@ def _split_balanced_html_sentences(inner_html: str, max_words: int = 24, math_pr
         else:
             expanded_sentences.append(sent)
 
-    # Keep sentences >= 6 words as individual read-along spans; merge tiny fragments (< 6 words)
-    min_standalone_words = 6
+    # Keep sentences >= min_standalone_words as individual read-along spans; merge tiny fragments (< min_standalone_words)
+    min_standalone_words = getattr(config, "MIN_PHRASE_WORDS", 4) if config else 4
+    pause_delim = getattr(config, "PAUSE_DELIMITER", " - ") if config else " - "
     grouped_chunks: List[Tuple[str, str]] = []
     curr_html_parts: List[str] = []
     curr_spoken_parts: List[str] = []
     curr_words = 0
+
+    def _join_spoken_parts(parts: List[str]) -> str:
+        if not parts:
+            return ""
+        if len(parts) == 1:
+            return parts[0]
+        # If any part was a micro-phrase (< min_standalone_words), join with cadence pause delimiter
+        has_micro = any(len(p.split()) < min_standalone_words for p in parts)
+        sep = pause_delim if has_micro else " "
+        return sep.join(parts)
 
     for sent_html in expanded_sentences:
         tts_input = math_processor.restore_tokens_for_tts(sent_html) if math_processor else sent_html
@@ -1228,23 +1244,25 @@ def _split_balanced_html_sentences(inner_html: str, max_words: int = 24, math_pr
             curr_words += s_words
         else:
             if curr_html_parts:
-                grouped_chunks.append((" ".join(curr_html_parts), " ".join(curr_spoken_parts)))
+                grouped_chunks.append((" ".join(curr_html_parts), _join_spoken_parts(curr_spoken_parts)))
             curr_html_parts = [sent_html]
             curr_spoken_parts = [spoken]
             curr_words = s_words
 
         if curr_words >= min_standalone_words:
-            grouped_chunks.append((" ".join(curr_html_parts), " ".join(curr_spoken_parts)))
+            grouped_chunks.append((" ".join(curr_html_parts), _join_spoken_parts(curr_spoken_parts)))
             curr_html_parts = []
             curr_spoken_parts = []
             curr_words = 0
 
     if curr_html_parts:
+        tail_spoken = _join_spoken_parts(curr_spoken_parts)
         if grouped_chunks and curr_words < min_standalone_words and (len(grouped_chunks[-1][1].split()) + curr_words <= max_words + 4):
             prev_h, prev_s = grouped_chunks[-1]
-            grouped_chunks[-1] = (prev_h + " " + " ".join(curr_html_parts), prev_s + " " + " ".join(curr_spoken_parts))
+            sep = pause_delim if (curr_words < min_standalone_words or len(prev_s.split()) < min_standalone_words) else " "
+            grouped_chunks[-1] = (prev_h + " " + " ".join(curr_html_parts), prev_s + sep + tail_spoken)
         else:
-            grouped_chunks.append((" ".join(curr_html_parts), " ".join(curr_spoken_parts)))
+            grouped_chunks.append((" ".join(curr_html_parts), tail_spoken))
 
     return grouped_chunks
 
@@ -1320,6 +1338,7 @@ def prepare_page_dom_and_chunks(
     md_opts=None,
     md_stats: Optional[dict] = None,
     pad_width: int = 4,
+    allow_empty_chunks: bool = False,
 ) -> PageDOMResult:
     """
     Converts a single page's Markdown or plain text into an EPUB3 XHTML document
@@ -1523,8 +1542,41 @@ def prepare_page_dom_and_chunks(
 
     _process_node(soup)
 
-    # Ensure every page has at least one spoken chunk so SMIL and per-page MP3 are always valid
-    if not chunks:
+    # Intra-page sliding window pass across chunks:
+    # Ensure no speech chunk is left with fewer than min_phrase_words (< 4 words)
+    min_phrase_words = getattr(config, "MIN_PHRASE_WORDS", 4) if config else 4
+    pause_delim = getattr(config, "PAUSE_DELIMITER", " - ") if config else " - "
+
+    if len(chunks) > 1:
+        merged_chunks: List[SpeechChunk] = []
+        for chk in chunks:
+            chk_words = len(chk.spoken_text.split())
+            if not merged_chunks:
+                merged_chunks.append(chk)
+                continue
+            prev = merged_chunks[-1]
+            prev_words = len(prev.spoken_text.split())
+            if chk_words < min_phrase_words or prev_words < min_phrase_words:
+                # Merge into previous chunk
+                new_spoken = f"{prev.spoken_text.strip()}{pause_delim}{chk.spoken_text.strip()}"
+                new_vis = f"{prev.visual_html} {chk.visual_html}"
+                merged_chunks[-1] = SpeechChunk(
+                    chunk_id=prev.chunk_id,
+                    page_num=prev.page_num,
+                    seq_idx=prev.seq_idx,
+                    spoken_text=new_spoken,
+                    visual_html=new_vis,
+                )
+                # In the soup HTML, update the absorbed chunk's span id to prev.chunk_id
+                target_span = soup.find(id=chk.chunk_id)
+                if target_span:
+                    target_span["id"] = prev.chunk_id
+            else:
+                merged_chunks.append(chk)
+        chunks = merged_chunks
+
+    # Ensure every page has at least one spoken chunk so SMIL and per-page MP3 are always valid (unless empty chunks explicitly allowed e.g. for merged micro-pages)
+    if not chunks and not allow_empty_chunks:
         cid = _next_chunk_id()
         spoken_fallback = verbalize_for_tts(f"{chapter_title}.", md_opts=md_opts, md_stats=md_stats)
         if not spoken_fallback:

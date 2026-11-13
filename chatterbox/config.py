@@ -35,11 +35,11 @@ MAX_NEW_TOKENS = 1000
 # CHUNKING / PROCESSING SETTINGS (ADHD-OPTIMIZED)
 # =============================================================================
 
-# Target max words per speech/highlight chunk.
-# 24 words (with single-sentence priority) keeps each EPUB3 SMIL read-along highlight
-# span to ~1 sentence (3-7 seconds), anchoring visual tracking and preventing
-# multi-sentence "wall of highlight" attention drift.
-CHUNK_SIZE_WORDS = 24
+# Sliding window word count limits
+MIN_PHRASE_WORDS = 4        # Phrases/pages below this are micro-phrases requiring merge
+CHUNK_SIZE_WORDS = 24       # Target optimal words per speech chunk
+MAX_CHUNK_WORDS = 32        # Upper bound before forcing a chunk boundary
+PAUSE_DELIMITER = " - "     # Cadence pause marker for merging micro-phrases/pages
 
 # Silence gap (ms) inserted between chunks when assembling the audiobook.
 # Combined with automatic leading/trailing dead-air trimming on each synthesized

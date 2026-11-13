@@ -23,6 +23,7 @@ models/
 *.metadata.json
 */__pycache__/
 .vscode
+batch_failures.txt
 
 # Pylance
 pyrightconfig.json
@@ -70,5 +71,6 @@ checkpoints/
 
 # Ignore generated sample .wav files
 **/*.wav
+chatterbox/chatterbox_repo
 chatterbox/chatterbox_repo
 chatterbox/chatterbox_repo
